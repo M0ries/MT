@@ -9,12 +9,14 @@ MT 是一个简洁的 Flutter 追番与影视记录应用，支持 Windows、mac
 - 从 Kazumi 的 WebDAV **只读**导入新版观看历史：`kazumiSync/history/snapshot.json` 和 `kazumiSync/history/changes/*.jsonl`。会导入作品信息、最近观看集数、播放位置和最近观看时间。已有的 MT 标题、状态、评分和评价会保留。
 - 将 MT 记录同步到同一个或另一台 WebDAV 的 `MT/records/`。每条作品单独保存，包含删除标记；不同设备各自新增的作品可合并，同一条记录由最新修改时间决定。连接后应用运行期间每十分钟同步一次，修改记录后也会同步。
 - 本地记录存入应用支持目录的 JSON 文件，保留上一版备份。WebDAV 密码只在当前应用会话的内存里保存。
+- 在“设置 → 外部导入”选择本地 MT JSON 备份（也支持单条记录 JSON），或同时选择 Kazumi 新版 `snapshot.json` 与多个 `changes/*.jsonl`。导入 MT 备份时保留较新的本机记录和已有删除标记。
 
 ## 使用
 
 1. 安装 Flutter 3.47.5 或兼容的稳定版，运行 `flutter pub get`。
 2. 运行 `flutter run -d macos`、`flutter run -d windows` 或 `flutter run -d ios`。
 3. 在“设置”里填写 WebDAV 地址和凭据。Kazumi 与 MT 可以填同一地址，也可以分别填写不同地址。首次使用点“立即导入”或“立即同步”。
+4. 不使用 WebDAV 时，也可在“设置 → 外部导入”选择本地文件。iPhone/iPad 可从“文件”应用选取。
 
 建议使用 HTTPS WebDAV。HTTP 连接会以明文传输 Basic 认证凭据；若必须连接局域网 HTTP 服务，请确认网络可信。
 
@@ -38,4 +40,4 @@ GitHub Actions 会运行检查并生成可下载的 Windows 安装程序（`.exe
 
 ## 发布
 
-项目已包含 Flutter 平台工程、依赖锁文件及 GitHub Actions 工作流。创建 GitHub 仓库后推送项目根目录即可运行自动构建。仓库公开前请检查应用标识 `app.memorytaker.memoryTaker` 是否与你的发布计划一致。
+源码与安装包发布在 [MT Releases](https://github.com/M0ries/MT/releases)。仓库目前为私有，只有有权限的 GitHub 帐号可下载。仓库公开前请检查应用标识 `app.memorytaker.memoryTaker` 是否与你的发布计划一致。
