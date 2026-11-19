@@ -1,0 +1,69 @@
+name: Build MT
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.5'
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.5'
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter build windows --release
+      - name: Include Windows runtime
+        shell: pwsh
+        run: |
+          $release = 'build/windows/x64/runner/Release'
+          foreach ($dll in @('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
+            Copy-Item (Join-Path $env:WINDIR "System32/$dll") $release -ErrorAction Stop
+          }
+      - run: choco install innosetup --no-progress -y
+      - run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\windows\MT.iss'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MT-Windows-Installer
+          path: build/installer/MT-Windows-Setup.exe
+
+  apple:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.5'
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter build macos --release
+      - run: mkdir -p build/dmg && cp -R build/macos/Build/Products/Release/MT.app build/dmg/ && ln -s /Applications build/dmg/Applications
+      - run: hdiutil create -volname MT -srcfolder build/dmg -ov -format UDZO MT-macOS.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MT-macOS-DMG
+          path: MT-macOS.dmg
+      - run: flutter build ios --release --no-codesign
+      - run: mkdir -p Payload && cp -R build/ios/iphoneos/Runner.app Payload/ && zip -qr MT-iOS-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MT-iOS-Unsigned-IPA
+          path: MT-iOS-unsigned.ipa
