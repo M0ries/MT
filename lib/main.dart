@@ -174,6 +174,9 @@ class _HomePageState extends State<HomePage> {
   int updateReceived = 0;
   int updateTotal = 0;
   final Map<String, Future<void>> _passwordWrites = {};
+  final Map<String, String> _syncStatus = {};
+  bool _autoSyncPending = false;
+  bool _autoSyncRunning = false;
   bool busy = false;
   Timer? timer;
 
@@ -186,9 +189,10 @@ class _HomePageState extends State<HomePage> {
     widget.store.addListener(_refresh);
     timer = Timer.periodic(
       const Duration(minutes: 10),
-      (_) => _backgroundSync(),
+      (_) => unawaited(_backgroundSync()),
     );
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_backgroundSync());
       if (mounted && widget.store.getString('updates.autoCheck') != 'false') {
         unawaited(_checkUpdate(automatic: true));
       }
@@ -383,33 +387,65 @@ class _HomePageState extends State<HomePage> {
   );
 
   Future<void> _backgroundSync() async {
-    if (busy) return;
-    if (kazumiPassword.isNotEmpty &&
-        widget.store.getString('kazumi.url').isNotEmpty) {
+    _autoSyncPending = true;
+    if (_autoSyncRunning || busy) return;
+    _autoSyncRunning = true;
+    try {
+      while (_autoSyncPending && mounted && !busy) {
+        _autoSyncPending = false;
+        await _syncOnce();
+      }
+    } finally {
+      _autoSyncRunning = false;
+      if (_autoSyncPending && mounted && !busy) {
+        unawaited(_backgroundSync());
+      }
+    }
+  }
+
+  Future<void> _syncOnce() async {
+    if (widget.store.getString('kazumi.url').isNotEmpty) {
       await _run(
         () => const KazumiImportService().import(
           widget.store,
           _credentials('kazumi', kazumiPassword),
         ),
         quiet: true,
+        syncKey: 'kazumi',
       );
     }
-    if (mtPassword.isNotEmpty && widget.store.getString('mt.url').isNotEmpty) {
+    if (busy) {
+      _autoSyncPending = true;
+      return;
+    }
+    if (widget.store.getString('mt.url').isNotEmpty) {
       await _run(
         () => const MtSyncService().sync(
           widget.store,
           _credentials('mt', mtPassword),
         ),
         quiet: true,
+        syncKey: 'mt',
       );
     }
   }
 
-  Future<T?> _run<T>(Future<T> Function() task, {bool quiet = false}) async {
+  Future<T?> _run<T>(
+    Future<T> Function() task, {
+    bool quiet = false,
+    String? syncKey,
+  }) async {
     if (busy) return null;
     setState(() => busy = true);
     try {
       final result = await task();
+      if (mounted && syncKey != null) {
+        setState(
+          () => _syncStatus[syncKey] = result is MtSyncResult
+              ? '同步成功：下载 ${result.downloaded} 条，上传 ${result.uploaded} 条'
+              : '导入成功：$result 条记录',
+        );
+      }
       if (mounted && !quiet) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -423,13 +459,21 @@ class _HomePageState extends State<HomePage> {
       }
       return result;
     } catch (e) {
+      if (mounted && syncKey != null) {
+        setState(() => _syncStatus[syncKey] = '失败：$e');
+      }
       if (mounted && !quiet) {
         ScaffoldMessenger.of(context)
             .showSnackBar(SnackBar(content: Text('$e')));
       }
       return null;
     } finally {
-      if (mounted) setState(() => busy = false);
+      if (mounted) {
+        setState(() => busy = false);
+        if (_autoSyncPending && !_autoSyncRunning) {
+          unawaited(_backgroundSync());
+        }
+      }
     }
   }
 
@@ -656,9 +700,7 @@ class _HomePageState extends State<HomePage> {
                     IconButton(
                       tooltip: '同步 MT',
                       icon: const Icon(Icons.sync),
-                      onPressed: mtPassword.isEmpty
-                          ? () => setState(() => page = 1)
-                          : () => _backgroundSync(),
+                      onPressed: () => unawaited(_backgroundSync()),
                     ),
                 ],
               ),
@@ -939,6 +981,7 @@ class _HomePageState extends State<HomePage> {
                 widget.store,
                 _credentials('mt', mtPassword),
               ),
+              syncKey: 'mt',
             ),
           ),
           const SizedBox(height: 16),
@@ -952,6 +995,7 @@ class _HomePageState extends State<HomePage> {
                 widget.store,
                 _credentials('kazumi', kazumiPassword),
               ),
+              syncKey: 'kazumi',
             ),
           ),
           const SizedBox(height: 16),
@@ -1100,11 +1144,22 @@ class _HomePageState extends State<HomePage> {
             Align(
               alignment: Alignment.centerRight,
               child: FilledButton.icon(
-                onPressed: busy || password.isEmpty ? null : onAction,
+                onPressed: busy ? null : onAction,
                 icon: Icon(prefix == 'mt' ? Icons.sync : Icons.download),
                 label: Text(prefix == 'mt' ? '立即同步' : '立即导入'),
               ),
             ),
+            if (_syncStatus[prefix] case final status?) ...[
+              const SizedBox(height: 8),
+              Text(
+                status,
+                style: TextStyle(
+                  color: status.startsWith('失败')
+                      ? Theme.of(context).colorScheme.error
+                      : Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ],
           ],
         ),
       ),
