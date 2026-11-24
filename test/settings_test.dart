@@ -16,21 +16,25 @@ void main() {
       final first = DavPasswordStore();
       await first.write('mt', 'mt-secret');
       await first.write('kazumi', 'kazumi-secret');
+      await first.writeUpdateToken('read-only-token');
 
       final reopened = DavPasswordStore();
       expect(await reopened.read('mt'), 'mt-secret');
       expect(await reopened.read('kazumi'), 'kazumi-secret');
+      expect(await reopened.readUpdateToken(), 'read-only-token');
 
       await reopened.write('mt', '');
       expect(await first.read('mt'), isEmpty);
       expect(await first.read('kazumi'), 'kazumi-secret');
+      await reopened.writeUpdateToken('');
+      expect(await first.readUpdateToken(), isEmpty);
     },
   );
 
   testWidgets('theme color changes immediately and survives reopening', (
     tester,
   ) async {
-    SharedPreferences.setMockInitialValues({});
+    SharedPreferences.setMockInitialValues({'updates.autoCheck': 'false'});
     FlutterSecureStorage.setMockInitialValues({});
     final directory = await tester.runAsync(
       () => Directory.systemTemp.createTemp('mt-theme-test-'),
@@ -48,10 +52,14 @@ void main() {
         passwords: DavPasswordStore(),
         mtPassword: '',
         kazumiPassword: '',
+        updateToken: '',
+        currentVersion: '1.0.3',
       ),
     );
     await tester.tap(find.text('设置'));
     await tester.pumpAndSettle();
+    expect(find.text('应用更新'), findsOneWidget);
+    expect(find.text('检查更新'), findsOneWidget);
     final before = Theme.of(tester.element(find.text('主题颜色')))
         .colorScheme
         .primary;

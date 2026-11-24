@@ -1,8 +1,11 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'data/bangumi.dart';
 import 'data/dav_password_store.dart';
@@ -10,6 +13,7 @@ import 'data/external_import.dart';
 import 'data/journal_store.dart';
 import 'data/kazumi_import.dart';
 import 'data/mt_sync.dart';
+import 'data/update_service.dart';
 import 'data/webdav.dart';
 import 'model/watch_entry.dart';
 
@@ -19,12 +23,16 @@ void main() async {
   final passwords = DavPasswordStore();
   final mtPassword = await passwords.read('mt');
   final kazumiPassword = await passwords.read('kazumi');
+  final updateToken = await passwords.readUpdateToken();
+  final currentVersion = (await PackageInfo.fromPlatform()).version;
   runApp(
     MemoryTaker(
       store: store,
       passwords: passwords,
       mtPassword: mtPassword,
       kazumiPassword: kazumiPassword,
+      updateToken: updateToken,
+      currentVersion: currentVersion,
     ),
   );
 }
@@ -57,11 +65,15 @@ class MemoryTaker extends StatelessWidget {
     required this.passwords,
     required this.mtPassword,
     required this.kazumiPassword,
+    required this.updateToken,
+    required this.currentVersion,
   });
   final JournalStore store;
   final DavPasswordStore passwords;
   final String mtPassword;
   final String kazumiPassword;
+  final String updateToken;
+  final String currentVersion;
 
   @override
   Widget build(BuildContext context) => ListenableBuilder(
@@ -100,6 +112,8 @@ class MemoryTaker extends StatelessWidget {
           passwords: passwords,
           initialMtPassword: mtPassword,
           initialKazumiPassword: kazumiPassword,
+          initialUpdateToken: updateToken,
+          currentVersion: currentVersion,
         ),
       );
     },
@@ -134,11 +148,15 @@ class HomePage extends StatefulWidget {
     required this.passwords,
     required this.initialMtPassword,
     required this.initialKazumiPassword,
+    required this.initialUpdateToken,
+    required this.currentVersion,
   });
   final JournalStore store;
   final DavPasswordStore passwords;
   final String initialMtPassword;
   final String initialKazumiPassword;
+  final String initialUpdateToken;
+  final String currentVersion;
   @override
   State<HomePage> createState() => _HomePageState();
 }
@@ -149,6 +167,12 @@ class _HomePageState extends State<HomePage> {
   String query = '';
   late String mtPassword;
   late String kazumiPassword;
+  late String updateToken;
+  UpdateRelease? availableUpdate;
+  bool checkingUpdate = false;
+  bool downloadingUpdate = false;
+  int updateReceived = 0;
+  int updateTotal = 0;
   final Map<String, Future<void>> _passwordWrites = {};
   bool busy = false;
   Timer? timer;
@@ -158,11 +182,17 @@ class _HomePageState extends State<HomePage> {
     super.initState();
     mtPassword = widget.initialMtPassword;
     kazumiPassword = widget.initialKazumiPassword;
+    updateToken = widget.initialUpdateToken;
     widget.store.addListener(_refresh);
     timer = Timer.periodic(
       const Duration(minutes: 10),
       (_) => _backgroundSync(),
     );
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && widget.store.getString('updates.autoCheck') != 'false') {
+        unawaited(_checkUpdate(automatic: true));
+      }
+    });
   }
 
   @override
@@ -184,19 +214,166 @@ class _HomePageState extends State<HomePage> {
         kazumiPassword = value;
       }
     });
-    final previous = _passwordWrites[account] ?? Future<void>.value();
-    final next = previous
-        .catchError((Object _) {})
-        .then((_) => widget.passwords.write(account, value));
-    _passwordWrites[account] = next;
+    _saveSecret(account, () => widget.passwords.write(account, value));
+  }
+
+  void _updateToken(String value) {
+    setState(() => updateToken = value.trim());
+    _saveSecret(
+      'github',
+      () => widget.passwords.writeUpdateToken(value.trim()),
+    );
+  }
+
+  void _saveSecret(String key, Future<void> Function() write) {
+    final previous = _passwordWrites[key] ?? Future<void>.value();
+    final next = previous.catchError((Object _) {}).then((_) => write());
+    _passwordWrites[key] = next;
     unawaited(
       next.catchError((Object error) {
         if (mounted) {
           ScaffoldMessenger.of(context)
-              .showSnackBar(SnackBar(content: Text('密码保存失败：$error')));
+              .showSnackBar(SnackBar(content: Text('凭据保存失败：$error')));
         }
       }),
     );
+  }
+
+  Future<void> _openReleasePage([Uri? page]) async {
+    final url = page ?? Uri.parse(mtReleasesUrl);
+    try {
+      if (!await launchUrl(url, mode: LaunchMode.externalApplication)) {
+        throw StateError('无法打开浏览器');
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('打开 GitHub 失败：$error')));
+      }
+    }
+  }
+
+  Future<void> _checkUpdate({bool automatic = false}) async {
+    if (checkingUpdate || downloadingUpdate) return;
+    setState(() => checkingUpdate = true);
+    try {
+      final release = await UpdateService().checkLatest(
+        currentVersion: widget.currentVersion,
+        token: updateToken,
+      );
+      if (!mounted) return;
+      setState(() => availableUpdate = release);
+      if (release == null) {
+        if (!automatic) {
+          ScaffoldMessenger.of(context)
+              .showSnackBar(const SnackBar(content: Text('当前已经是最新版本')));
+        }
+      } else {
+        await _showUpdateDialog(release);
+      }
+    } catch (error) {
+      if (mounted && !automatic) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('$error')));
+      }
+    } finally {
+      if (mounted) setState(() => checkingUpdate = false);
+    }
+  }
+
+  Future<void> _showUpdateDialog(UpdateRelease release) async {
+    final asset = release.assetForPlatform(Platform.operatingSystem);
+    final action = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text('发现新版本 v${release.version}'),
+        content: SizedBox(
+          width: 420,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('当前版本 v${widget.currentVersion}'),
+              const SizedBox(height: 12),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 190),
+                child: SingleChildScrollView(
+                  child: SelectableText(
+                    release.notes.isEmpty ? '查看 GitHub 获取更新说明。' : release.notes,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('稍后'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, 'github'),
+            child: const Text('在 GitHub 查看'),
+          ),
+          if (asset != null)
+            FilledButton.icon(
+              onPressed: () => Navigator.pop(dialogContext, 'download'),
+              icon: const Icon(Icons.download_outlined),
+              label: const Text('下载并打开安装包'),
+            ),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    if (action == 'github') await _openReleasePage(release.page);
+    if (action == 'download' && asset != null) {
+      await _downloadAndOpen(release, asset);
+    }
+  }
+
+  Future<void> _downloadAndOpen(
+    UpdateRelease release,
+    ReleaseAsset asset,
+  ) async {
+    if (downloadingUpdate) return;
+    setState(() {
+      downloadingUpdate = true;
+      updateReceived = 0;
+      updateTotal = asset.size;
+    });
+    try {
+      final file = await UpdateService().downloadAsset(
+        release,
+        asset,
+        token: updateToken,
+        onProgress: (received, total) {
+          if (mounted) {
+            setState(() {
+              updateReceived = received;
+              updateTotal = total;
+            });
+          }
+        },
+      );
+      if (!mounted) return;
+      if (!await launchUrl(
+        Uri.file(file.path),
+        mode: LaunchMode.externalApplication,
+      )) {
+        throw StateError('无法打开安装包');
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text('已打开安装包，请按系统提示完成更新')));
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('更新失败：$error')));
+      }
+    } finally {
+      if (mounted) setState(() => downloadingUpdate = false);
+    }
   }
 
   DavCredentials _credentials(String prefix, String password) => DavCredentials(
@@ -696,6 +873,14 @@ class _HomePageState extends State<HomePage> {
           ),
           const SizedBox(height: 24),
           Text(
+            '应用更新',
+            style: Theme.of(context).textTheme.headlineSmall
+                ?.copyWith(fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 12),
+          _updatePanel(),
+          const SizedBox(height: 24),
+          Text(
             '数据与同步',
             style: Theme.of(context).textTheme.headlineSmall
                 ?.copyWith(fontWeight: FontWeight.bold),
@@ -783,6 +968,92 @@ class _HomePageState extends State<HomePage> {
       ),
     ),
   );
+
+  Widget _updatePanel() {
+    final release = availableUpdate;
+    final asset = release?.assetForPlatform(Platform.operatingSystem);
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '当前版本 v${widget.currentVersion}',
+              style: Theme.of(context).textTheme.titleMedium
+                  ?.copyWith(fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 6),
+            const Text(
+              '发现新版本后，桌面端可在应用内下载并打开安装包；iPhone/iPad 前往 GitHub 下载并自行签名安装。',
+            ),
+            const SizedBox(height: 8),
+            SwitchListTile.adaptive(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('启动时检查更新'),
+              value: widget.store.getString('updates.autoCheck') != 'false',
+              onChanged: (value) =>
+                  widget.store.setString('updates.autoCheck', value.toString()),
+            ),
+            const SizedBox(height: 6),
+            TextFormField(
+              initialValue: updateToken,
+              obscureText: true,
+              autocorrect: false,
+              enableSuggestions: false,
+              onChanged: _updateToken,
+              decoration: const InputDecoration(
+                labelText: 'GitHub 访问令牌（私有仓库需要）',
+              ),
+            ),
+            const SizedBox(height: 6),
+            const Text('只需此仓库的 Contents 读取权限；令牌保存在本机系统安全存储中。公开仓库可留空。'),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                FilledButton.icon(
+                  onPressed: checkingUpdate || downloadingUpdate
+                      ? null
+                      : () => _checkUpdate(),
+                  icon: const Icon(Icons.system_update_outlined),
+                  label: Text(checkingUpdate ? '正在检查…' : '检查更新'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: () => _openReleasePage(),
+                  icon: const Icon(Icons.open_in_new),
+                  label: const Text('打开 GitHub Releases'),
+                ),
+                if (release != null && asset != null)
+                  OutlinedButton.icon(
+                    onPressed: downloadingUpdate
+                        ? null
+                        : () => _downloadAndOpen(release, asset),
+                    icon: const Icon(Icons.download_outlined),
+                    label: const Text('下载并打开安装包'),
+                  ),
+              ],
+            ),
+            if (release != null) ...[
+              const SizedBox(height: 12),
+              Text('可更新至 v${release.version}'),
+            ],
+            if (downloadingUpdate) ...[
+              const SizedBox(height: 12),
+              LinearProgressIndicator(
+                value: updateTotal > 0
+                    ? (updateReceived / updateTotal).clamp(0.0, 1.0)
+                    : null,
+              ),
+              const SizedBox(height: 4),
+              Text('正在下载：${(updateReceived / 1048576).toStringAsFixed(1)} MB'),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
 
   Widget _davPanel(
     String title,

@@ -27,4 +27,15 @@ class DavPasswordStore {
       await _storage.write(key: _key(account), value: password);
     }
   }
+
+  Future<String> readUpdateToken() async =>
+      await _storage.read(key: 'github.update.token') ?? '';
+
+  Future<void> writeUpdateToken(String token) async {
+    if (token.isEmpty) {
+      await _storage.delete(key: 'github.update.token');
+    } else {
+      await _storage.write(key: 'github.update.token', value: token);
+    }
+  }
 }
