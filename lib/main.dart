@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'data/bangumi.dart';
+import 'data/dav_password_store.dart';
 import 'data/external_import.dart';
 import 'data/journal_store.dart';
 import 'data/kazumi_import.dart';
@@ -15,11 +16,34 @@ import 'model/watch_entry.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final store = await JournalStore.open();
-  runApp(MemoryTaker(store: store));
+  final passwords = DavPasswordStore();
+  final mtPassword = await passwords.read('mt');
+  final kazumiPassword = await passwords.read('kazumi');
+  runApp(
+    MemoryTaker(
+      store: store,
+      passwords: passwords,
+      mtPassword: mtPassword,
+      kazumiPassword: kazumiPassword,
+    ),
+  );
 }
 
-const _blue = Color(0xFF5065B8);
-const _surface = Color(0xFFF7F8FC);
+const _accentColors = <({String id, String name, Color color})>[
+  (id: 'blue', name: '蓝色', color: Color(0xFF5065B8)),
+  (id: 'teal', name: '青绿', color: Color(0xFF148B83)),
+  (id: 'green', name: '绿色', color: Color(0xFF4E8061)),
+  (id: 'orange', name: '橙色', color: Color(0xFFC66B39)),
+  (id: 'pink', name: '粉色', color: Color(0xFFBA6287)),
+  (id: 'purple', name: '紫色', color: Color(0xFF8464B2)),
+];
+Color _accentFor(String id) {
+  for (final choice in _accentColors) {
+    if (choice.id == id) return choice.color;
+  }
+  return _accentColors.first.color;
+}
+
 const _importFiles = XTypeGroup(
   label: 'JSON 历史文件',
   extensions: ['json', 'jsonl'],
@@ -27,35 +51,58 @@ const _importFiles = XTypeGroup(
 );
 
 class MemoryTaker extends StatelessWidget {
-  const MemoryTaker({super.key, required this.store});
+  const MemoryTaker({
+    super.key,
+    required this.store,
+    required this.passwords,
+    required this.mtPassword,
+    required this.kazumiPassword,
+  });
   final JournalStore store;
+  final DavPasswordStore passwords;
+  final String mtPassword;
+  final String kazumiPassword;
 
   @override
-  Widget build(BuildContext context) => MaterialApp(
-    title: 'MT · Memory Taker',
-    debugShowCheckedModeBanner: false,
-    theme: ThemeData(
-      useMaterial3: true,
-      colorScheme: ColorScheme.fromSeed(seedColor: _blue),
-      scaffoldBackgroundColor: _surface,
-      appBarTheme: const AppBarTheme(
-        backgroundColor: _surface,
-        surfaceTintColor: Colors.transparent,
-      ),
-      inputDecorationTheme: InputDecorationTheme(
-        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-        contentPadding: const EdgeInsets.symmetric(
-          horizontal: 14,
-          vertical: 12,
+  Widget build(BuildContext context) => ListenableBuilder(
+    listenable: store,
+    builder: (context, _) {
+      final accent = _accentFor(store.getString('appearance.accent'));
+      final surface = Color.lerp(const Color(0xFFF7F8FC), accent, 0.045)!;
+      return MaterialApp(
+        title: 'MT · Memory Taker',
+        debugShowCheckedModeBanner: false,
+        theme: ThemeData(
+          useMaterial3: true,
+          colorScheme: ColorScheme.fromSeed(seedColor: accent),
+          scaffoldBackgroundColor: surface,
+          appBarTheme: AppBarTheme(
+            backgroundColor: surface,
+            surfaceTintColor: Colors.transparent,
+          ),
+          inputDecorationTheme: InputDecorationTheme(
+            border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 14,
+              vertical: 12,
+            ),
+          ),
+          cardTheme: CardThemeData(
+            elevation: 0,
+            color: Colors.white,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16),
+            ),
+          ),
         ),
-      ),
-      cardTheme: CardThemeData(
-        elevation: 0,
-        color: Colors.white,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      ),
-    ),
-    home: HomePage(store: store),
+        home: HomePage(
+          store: store,
+          passwords: passwords,
+          initialMtPassword: mtPassword,
+          initialKazumiPassword: kazumiPassword,
+        ),
+      );
+    },
   );
 }
 
@@ -81,8 +128,17 @@ String _duration(int? ms) {
 }
 
 class HomePage extends StatefulWidget {
-  const HomePage({super.key, required this.store});
+  const HomePage({
+    super.key,
+    required this.store,
+    required this.passwords,
+    required this.initialMtPassword,
+    required this.initialKazumiPassword,
+  });
   final JournalStore store;
+  final DavPasswordStore passwords;
+  final String initialMtPassword;
+  final String initialKazumiPassword;
   @override
   State<HomePage> createState() => _HomePageState();
 }
@@ -91,14 +147,17 @@ class _HomePageState extends State<HomePage> {
   int page = 0;
   WatchStatus? filter;
   String query = '';
-  String mtPassword = '';
-  String kazumiPassword = '';
+  late String mtPassword;
+  late String kazumiPassword;
+  final Map<String, Future<void>> _passwordWrites = {};
   bool busy = false;
   Timer? timer;
 
   @override
   void initState() {
     super.initState();
+    mtPassword = widget.initialMtPassword;
+    kazumiPassword = widget.initialKazumiPassword;
     widget.store.addListener(_refresh);
     timer = Timer.periodic(
       const Duration(minutes: 10),
@@ -115,6 +174,29 @@ class _HomePageState extends State<HomePage> {
 
   void _refresh() {
     if (mounted) setState(() {});
+  }
+
+  void _updatePassword(String account, String value) {
+    setState(() {
+      if (account == 'mt') {
+        mtPassword = value;
+      } else {
+        kazumiPassword = value;
+      }
+    });
+    final previous = _passwordWrites[account] ?? Future<void>.value();
+    final next = previous
+        .catchError((Object _) {})
+        .then((_) => widget.passwords.write(account, value));
+    _passwordWrites[account] = next;
+    unawaited(
+      next.catchError((Object error) {
+        if (mounted) {
+          ScaffoldMessenger.of(context)
+              .showSnackBar(SnackBar(content: Text('密码保存失败：$error')));
+        }
+      }),
+    );
   }
 
   DavCredentials _credentials(String prefix, String password) => DavCredentials(
@@ -566,13 +648,61 @@ class _HomePageState extends State<HomePage> {
         padding: const EdgeInsets.fromLTRB(20, 12, 20, 40),
         children: [
           Text(
+            '外观与个性化',
+            style: Theme.of(context).textTheme.headlineSmall
+                ?.copyWith(fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 12),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '主题颜色',
+                    style: Theme.of(context).textTheme.titleMedium
+                        ?.copyWith(fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 6),
+                  const Text('选择喜欢的颜色，界面会立即更新并在下次打开时保留。'),
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      for (final choice in _accentColors)
+                        ChoiceChip(
+                          avatar: CircleAvatar(
+                            radius: 9,
+                            backgroundColor: choice.color,
+                          ),
+                          label: Text(choice.name),
+                          selected:
+                              _accentFor(
+                                widget.store.getString('appearance.accent'),
+                              ) ==
+                              choice.color,
+                          onSelected: (_) => widget.store.setString(
+                            'appearance.accent',
+                            choice.id,
+                          ),
+                        ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 24),
+          Text(
             '数据与同步',
             style: Theme.of(context).textTheme.headlineSmall
                 ?.copyWith(fontWeight: FontWeight.bold),
           ),
           const SizedBox(height: 6),
           const Text(
-            'MT 的 WebDAV 数据保存在 MT/records/；Kazumi 数据只读。密码只在本次打开期间保留。建议使用 HTTPS。',
+            'MT 的 WebDAV 数据保存在 MT/records/；Kazumi 数据只读。WebDAV 密码保存在本机系统安全存储中，退出后仍会保留。建议使用 HTTPS。',
           ),
           const SizedBox(height: 20),
           Card(
@@ -618,7 +748,7 @@ class _HomePageState extends State<HomePage> {
             'MT 多端同步',
             'mt',
             mtPassword,
-            (v) => setState(() => mtPassword = v),
+            (v) => _updatePassword('mt', v),
             () => _run(
               () => const MtSyncService().sync(
                 widget.store,
@@ -631,7 +761,7 @@ class _HomePageState extends State<HomePage> {
             '从 Kazumi 导入',
             'kazumi',
             kazumiPassword,
-            (v) => setState(() => kazumiPassword = v),
+            (v) => _updatePassword('kazumi', v),
             () => _run(
               () => const KazumiImportService().import(
                 widget.store,
@@ -693,7 +823,7 @@ class _HomePageState extends State<HomePage> {
               initialValue: password,
               obscureText: true,
               onChanged: onPassword,
-              decoration: const InputDecoration(labelText: '密码或应用专用密码（本次会话）'),
+              decoration: const InputDecoration(labelText: '密码或应用专用密码（保存在本机）'),
             ),
             const SizedBox(height: 12),
             Align(
