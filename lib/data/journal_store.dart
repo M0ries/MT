@@ -12,12 +12,15 @@ class JournalStore extends ChangeNotifier {
   final SharedPreferences _prefs;
   final File _file;
   final Map<String, WatchEntry> _entries = {};
+  Future<void> _pendingSave = Future<void>.value();
 
   static Future<JournalStore> open({Directory? directory}) async {
     final base = directory ?? await getApplicationSupportDirectory();
     await base.create(recursive: true);
-    final store = JournalStore(await SharedPreferences.getInstance(),
-      File('${base.path}${Platform.pathSeparator}mt_records_v1.json'));
+    final store = JournalStore(
+      await SharedPreferences.getInstance(),
+      File('${base.path}${Platform.pathSeparator}mt_records_v1.json'),
+    );
     String? raw;
     if (await store._file.exists()) {
       raw = await store._file.readAsString();
@@ -28,7 +31,9 @@ class JournalStore extends ChangeNotifier {
       try {
         final data = jsonDecode(raw) as Map<String, dynamic>;
         for (final value in data['entries'] as List? ?? const []) {
-          final entry = WatchEntry.fromJson(Map<String, dynamic>.from(value as Map));
+          final entry = WatchEntry.fromJson(
+            Map<String, dynamic>.from(value as Map),
+          );
           store._entries[entry.id] = entry;
         }
       } catch (_) {
@@ -37,7 +42,9 @@ class JournalStore extends ChangeNotifier {
           final recovered = await backup.readAsString();
           final data = jsonDecode(recovered) as Map<String, dynamic>;
           for (final value in data['entries'] as List? ?? const []) {
-            final entry = WatchEntry.fromJson(Map<String, dynamic>.from(value as Map));
+            final entry = WatchEntry.fromJson(
+              Map<String, dynamic>.from(value as Map),
+            );
             store._entries[entry.id] = entry;
           }
           await store._file.writeAsString(recovered, flush: true);
@@ -49,14 +56,17 @@ class JournalStore extends ChangeNotifier {
     return store;
   }
 
-  List<WatchEntry> get entries => _entries.values.where((e) => !e.deleted).toList()
-    ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+  List<WatchEntry> get entries =>
+      _entries.values.where((e) => !e.deleted).toList()
+        ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
 
   List<WatchEntry> get allEntries => _entries.values.toList();
   WatchEntry? byId(String id) => _entries[id];
   WatchEntry? byBangumiId(int id, {bool includeDeleted = false}) {
     for (final item in _entries.values) {
-      if ((includeDeleted || !item.deleted) && item.bangumiId == id) return item;
+      if ((includeDeleted || !item.deleted) && item.bangumiId == id) {
+        return item;
+      }
     }
     return null;
   }
@@ -80,7 +90,15 @@ class JournalStore extends ChangeNotifier {
     await _save();
   }
 
-  Future<void> _save() async {
+  Future<void> _save() {
+    final next = _pendingSave
+        .catchError((Object _) {})
+        .then((_) => _writeSnapshot());
+    _pendingSave = next;
+    return next;
+  }
+
+  Future<void> _writeSnapshot() async {
     final temporary = File('${_file.path}.tmp');
     await temporary.writeAsString(encodeEntries(_entries.values), flush: true);
     if (await _file.exists()) {

@@ -11,6 +11,27 @@ import 'package:memory_taker/model/watch_entry.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
+  test('simultaneous imports keep every record on disk', () async {
+    SharedPreferences.setMockInitialValues({});
+    final directory = await Directory.systemTemp.createTemp('mt-overlap-test-');
+    addTearDown(() => directory.delete(recursive: true));
+    final store = await JournalStore.open(directory: directory);
+    WatchEntry entry(String id) => WatchEntry(
+      id: id,
+      title: id,
+      kind: WatchKind.anime,
+      status: WatchStatus.completed,
+      updatedAt: DateTime.utc(2026, 11, 25),
+    );
+    await Future.wait([
+      store.putAll([entry('first')]),
+      store.putAll([entry('second')]),
+    ]);
+    final reopened = await JournalStore.open(directory: directory);
+    expect(reopened.byId('first')?.title, 'first');
+    expect(reopened.byId('second')?.title, 'second');
+  });
+
   test('record dates, rating and tombstone survive JSON round trip', () {
     final entry = WatchEntry(
       id: 'b123',

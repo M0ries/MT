@@ -178,6 +178,7 @@ class _HomePageState extends State<HomePage> {
   bool _autoSyncPending = false;
   bool _autoSyncRunning = false;
   bool busy = false;
+  bool importing = false;
   Timer? timer;
 
   @override
@@ -489,10 +490,12 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _importMtFile() async {
+    if (importing) return;
+    setState(() => importing = true);
     try {
       final file = await openFile(acceptedTypeGroups: const [_importFiles]);
       if (file == null) return;
-      await _run(
+      await _runLocalImport(
         () async => const ExternalImportService().importMtJson(
           widget.store,
           await file.readAsString(),
@@ -503,14 +506,18 @@ class _HomePageState extends State<HomePage> {
         ScaffoldMessenger.of(context)
             .showSnackBar(SnackBar(content: Text('无法打开文件：$e')));
       }
+    } finally {
+      if (mounted) setState(() => importing = false);
     }
   }
 
   Future<void> _importKazumiFiles() async {
+    if (importing) return;
+    setState(() => importing = true);
     try {
       final files = await openFiles(acceptedTypeGroups: const [_importFiles]);
       if (files.isEmpty) return;
-      await _run(() async {
+      await _runLocalImport(() async {
         String? snapshot;
         final changes = <String>[];
         for (final file in files) {
@@ -537,6 +544,24 @@ class _HomePageState extends State<HomePage> {
       if (mounted) {
         ScaffoldMessenger.of(context)
             .showSnackBar(SnackBar(content: Text('无法打开文件：$e')));
+      }
+    } finally {
+      if (mounted) setState(() => importing = false);
+    }
+  }
+
+  Future<void> _runLocalImport(Future<int> Function() task) async {
+    try {
+      final count = await task();
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('已导入 $count 条记录')));
+        unawaited(_backgroundSync());
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('导入失败：$error')));
       }
     }
   }
@@ -951,12 +976,12 @@ class _HomePageState extends State<HomePage> {
                     runSpacing: 8,
                     children: [
                       OutlinedButton.icon(
-                        onPressed: busy ? null : _importMtFile,
+                        onPressed: importing ? null : _importMtFile,
                         icon: const Icon(Icons.file_open_outlined),
                         label: const Text('导入 MT JSON'),
                       ),
                       OutlinedButton.icon(
-                        onPressed: busy ? null : _importKazumiFiles,
+                        onPressed: importing ? null : _importKazumiFiles,
                         icon: const Icon(Icons.history_outlined),
                         label: const Text('导入 Kazumi 文件'),
                       ),
