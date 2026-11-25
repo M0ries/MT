@@ -1672,12 +1672,12 @@ class _EntryEditorState extends State<EntryEditor> {
     }
   }
 
-  Future<void> _refreshEpisodeCount() async {
+  Future<void> _refreshEpisodeCount({bool force = false}) async {
     final id = widget.entry?.bangumiId;
     if (id == null || refreshingEpisodeCount) return;
     setState(() => refreshingEpisodeCount = true);
     try {
-      final subject = await BangumiClient().detail(id);
+      final subject = await BangumiClient().detail(id, refresh: force);
       if (mounted && subject.episodeCount > 0 && !episodeCountManual) {
         setState(() => episodeCount.text = subject.episodeCount.toString());
       }
@@ -1955,8 +1955,19 @@ class _EntryEditorState extends State<EntryEditor> {
                   value: !episodeCountManual,
                   onChanged: (value) {
                     setState(() => episodeCountManual = !value);
-                    if (value) unawaited(_refreshEpisodeCount());
+                    if (value) unawaited(_refreshEpisodeCount(force: true));
                   },
+                ),
+              if (widget.entry?.bangumiId != null && !episodeCountManual)
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton.icon(
+                    onPressed: refreshingEpisodeCount
+                        ? null
+                        : () => _refreshEpisodeCount(force: true),
+                    icon: const Icon(Icons.refresh),
+                    label: const Text('刷新 Bangumi 集数'),
+                  ),
                 ),
               if (widget.entry?.progressMs != null)
                 Padding(

@@ -24,6 +24,7 @@ class ContentCache {
     String key,
     Future<dynamic> Function() fetch, {
     Duration lifetime = const Duration(days: 3),
+    bool refresh = false,
   }) async {
     final directory = await _directory();
     final file = File(
@@ -33,7 +34,8 @@ class ContentCache {
     if (await file.exists()) {
       try {
         cached = jsonDecode(await file.readAsString());
-        if (DateTime.now().difference(await file.lastModified()) < lifetime) {
+        if (!refresh &&
+            DateTime.now().difference(await file.lastModified()) < lifetime) {
           return cached;
         }
       } catch (_) {}
@@ -43,7 +45,7 @@ class ContentCache {
       await file.writeAsString(jsonEncode(value));
       return value;
     } catch (_) {
-      if (cached != null) return cached;
+      if (cached != null && !refresh) return cached;
       rethrow;
     }
   }

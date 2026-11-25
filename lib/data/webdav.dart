@@ -181,7 +181,7 @@ class WebDavClient {
       'PROPFIND',
       path,
       action: '列出 $path',
-      body: '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getetag/><d:getlastmodified/></d:prop></d:propfind>',
+      body: '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getetag/></d:prop></d:propfind>',
       headers: {
         'Depth': '1',
         HttpHeaders.contentTypeHeader: 'application/xml; charset=utf-8',
@@ -205,16 +205,14 @@ class WebDavClient {
       final uri = Uri.tryParse(href);
       if (uri == null) continue;
       final resourcePath = Uri.decodeComponent(uri.path);
-      if (!resourcePath.startsWith('$basePath/') || resourcePath.endsWith('/')) {
+      if (!resourcePath.startsWith('$basePath/') ||
+          resourcePath.endsWith('/')) {
         continue;
       }
       final name = resourcePath.substring(basePath.length + 1);
       if (name.contains('/')) continue;
       final etag = property(block, 'getetag');
-      final modified = property(block, 'getlastmodified');
-      resources.add(
-        DavResource(name, etag?.isNotEmpty == true ? etag : modified),
-      );
+      resources.add(DavResource(name, etag?.isNotEmpty == true ? etag : null));
     }
     return resources;
   }

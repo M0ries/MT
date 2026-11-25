@@ -92,10 +92,11 @@ class BangumiClient {
         .toList();
   }
 
-  Future<BangumiSubject> detail(int id) async {
+  Future<BangumiSubject> detail(int id, {bool refresh = false}) async {
     final result = await ContentCache.instance.jsonResponse(
       'bangumi-detail:$id',
       () => _request('GET', '/v0/subjects/$id'),
+      refresh: refresh,
     );
     return BangumiSubject.fromJson(Map<String, dynamic>.from(result as Map));
   }
