@@ -56,6 +56,69 @@ void main() {
     expect(decoded.deleted, true);
   });
 
+  test('OVA and custom episode count survive export and import', () {
+    final entry = WatchEntry(
+      id: 'ova1', title: '特别篇', kind: WatchKind.anime,
+      status: WatchStatus.watching, updatedAt: DateTime.utc(2026),
+      episodeCount: 4, episodeCountManual: true, ovaOverride: true,
+    );
+    final restored = WatchEntry.fromJson(entry.toJson());
+    expect(restored.isOva, true);
+    expect(restored.episodeCountManual, true);
+    expect(restored.episodeCount, 4);
+    final legacy = WatchEntry.fromJson({...entry.toJson()}..remove('episodeCountManual'));
+    expect(legacy.episodeCountManual, true);
+  });
+
+  test('unchanged WebDAV ETag avoids downloading records again', () async {
+    SharedPreferences.setMockInitialValues({});
+    final directory = await Directory.systemTemp.createTemp('mt-etag-test-');
+    final cacheDirectory = await Directory.systemTemp.createTemp('mt-etag-cache-');
+    addTearDown(() async {
+      await directory.delete(recursive: true);
+      await cacheDirectory.delete(recursive: true);
+    });
+    final store = await JournalStore.open(directory: directory);
+    var version = 'v1';
+    var gets = 0;
+    WatchEntry remote(String title, int day) => WatchEntry(
+      id: 'remote1', title: title, kind: WatchKind.anime,
+      status: WatchStatus.completed, updatedAt: DateTime.utc(2026, 1, day),
+    );
+    var body = jsonEncode(remote('旧标题', 1).toJson());
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    server.listen((request) async {
+      if (request.method == 'PROPFIND') {
+        request.response.statusCode = 207;
+        request.response.write('<d:multistatus xmlns:d="DAV:"><d:response>'
+          '<d:href>/MT/records/remote1.json</d:href>'
+          '<d:propstat><d:prop><d:getetag>$version</d:getetag></d:prop>'
+          '<d:status>HTTP/1.1 200 OK</d:status></d:propstat>'
+          '</d:response></d:multistatus>');
+      } else if (request.method == 'GET') {
+        gets++;
+        request.response.write(body);
+      } else {
+        request.response.statusCode = 405;
+      }
+      await request.response.close();
+    });
+    try {
+      final credentials = DavCredentials('http://127.0.0.1:${server.port}/', 'user', 'pass');
+      await const MtSyncService().sync(store, credentials, cacheDirectory: cacheDirectory);
+      expect(gets, 1);
+      await const MtSyncService().sync(store, credentials, cacheDirectory: cacheDirectory);
+      expect(gets, 1);
+      version = 'v2';
+      body = jsonEncode(remote('新标题', 2).toJson());
+      await const MtSyncService().sync(store, credentials, cacheDirectory: cacheDirectory);
+      expect(gets, 2);
+      expect(store.byId('remote1')?.title, '新标题');
+    } finally {
+      await server.close(force: true);
+    }
+  });
+
   test(
     'MT WebDAV sync merges separate records and retains deletions',
     () async {
@@ -110,6 +173,7 @@ void main() {
         final result = await const MtSyncService().sync(
           store,
           DavCredentials('http://127.0.0.1:${server.port}/', 'user', 'pass'),
+          cacheDirectory: await Directory.systemTemp.createTemp('mt-sync-cache-'),
         );
         expect(result.downloaded, 1);
         expect(result.uploaded, 1);
@@ -192,9 +256,11 @@ void main() {
       await request.response.close();
     });
     try {
+      final cacheDirectory = await Directory.systemTemp.createTemp('kazumi-cache-');
       final count = await const KazumiImportService().import(
         store,
         DavCredentials('http://127.0.0.1:${server.port}/', 'user', 'pass'),
+        cacheDirectory: cacheDirectory,
       );
       expect(count, 1);
       expect(store.byId('b123')?.title, '我的标题');
@@ -207,6 +273,7 @@ void main() {
         await const KazumiImportService().import(
           store,
           DavCredentials('http://127.0.0.1:${server.port}/', 'user', 'pass'),
+          cacheDirectory: cacheDirectory,
         ),
         0,
       );

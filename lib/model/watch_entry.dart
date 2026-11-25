@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:math';
 
 enum WatchKind { anime, movie, series }
+
 enum WatchStatus { planned, watching, completed, paused, dropped }
 
 String newEntryId() {
@@ -29,6 +30,8 @@ class WatchEntry {
     this.notes = '',
     this.episode,
     this.episodeCount,
+    this.episodeCountManual = false,
+    this.ovaOverride,
     this.progressMs,
     this.lastWatchAt,
     this.kazumiSource = '',
@@ -52,6 +55,14 @@ class WatchEntry {
   final String notes;
   final int? episode;
   final int? episodeCount;
+  final bool episodeCountManual;
+  final bool? ovaOverride;
+  bool get isOva =>
+      ovaOverride ??
+      RegExp(
+        r'(^|[^A-Za-z])OVA([^A-Za-z]|$)',
+        caseSensitive: false,
+      ).hasMatch(title);
   final int? progressMs;
   final DateTime? lastWatchAt;
   final String kazumiSource;
@@ -74,68 +85,75 @@ class WatchEntry {
     String? notes,
     int? episode,
     int? episodeCount,
+    bool? episodeCountManual,
+    bool? ovaOverride,
     int? progressMs,
     DateTime? lastWatchAt,
     String? kazumiSource,
     DateTime? updatedAt,
     bool? deleted,
   }) => WatchEntry(
-        id: id,
-        bangumiId: bangumiId,
-        title: title ?? this.title,
-        originalTitle: originalTitle ?? this.originalTitle,
-        summary: summary ?? this.summary,
-        coverUrl: coverUrl ?? this.coverUrl,
-        kind: kind ?? this.kind,
-        status: status ?? this.status,
-        firstWatchDate: firstWatchDate ?? this.firstWatchDate,
-        finishDate: finishDate ?? this.finishDate,
-        dropDate: dropDate ?? this.dropDate,
-        rewatchDates: rewatchDates ?? this.rewatchDates,
-        rating: rating ?? this.rating,
-        favorite: favorite ?? this.favorite,
-        notes: notes ?? this.notes,
-        episode: episode ?? this.episode,
-        episodeCount: episodeCount ?? this.episodeCount,
-        progressMs: progressMs ?? this.progressMs,
-        lastWatchAt: lastWatchAt ?? this.lastWatchAt,
-        kazumiSource: kazumiSource ?? this.kazumiSource,
-        updatedAt: updatedAt ?? DateTime.now().toUtc(),
-        deleted: deleted ?? this.deleted,
-      );
+    id: id,
+    bangumiId: bangumiId,
+    title: title ?? this.title,
+    originalTitle: originalTitle ?? this.originalTitle,
+    summary: summary ?? this.summary,
+    coverUrl: coverUrl ?? this.coverUrl,
+    kind: kind ?? this.kind,
+    status: status ?? this.status,
+    firstWatchDate: firstWatchDate ?? this.firstWatchDate,
+    finishDate: finishDate ?? this.finishDate,
+    dropDate: dropDate ?? this.dropDate,
+    rewatchDates: rewatchDates ?? this.rewatchDates,
+    rating: rating ?? this.rating,
+    favorite: favorite ?? this.favorite,
+    notes: notes ?? this.notes,
+    episode: episode ?? this.episode,
+    episodeCount: episodeCount ?? this.episodeCount,
+    episodeCountManual: episodeCountManual ?? this.episodeCountManual,
+    ovaOverride: ovaOverride ?? this.ovaOverride,
+    progressMs: progressMs ?? this.progressMs,
+    lastWatchAt: lastWatchAt ?? this.lastWatchAt,
+    kazumiSource: kazumiSource ?? this.kazumiSource,
+    updatedAt: updatedAt ?? DateTime.now().toUtc(),
+    deleted: deleted ?? this.deleted,
+  );
 
   Map<String, dynamic> toJson() => {
-        'schemaVersion': 1,
-        'id': id,
-        'bangumiId': bangumiId,
-        'title': title,
-        'originalTitle': originalTitle,
-        'summary': summary,
-        'coverUrl': coverUrl,
-        'kind': kind.name,
-        'status': status.name,
-        'firstWatchDate': firstWatchDate?.toIso8601String(),
-        'finishDate': finishDate?.toIso8601String(),
-        'dropDate': dropDate?.toIso8601String(),
-        'rewatchDates': rewatchDates.map((e) => e.toIso8601String()).toList(),
-        'rating': rating,
-        'favorite': favorite,
-        'notes': notes,
-        'episode': episode,
-        'episodeCount': episodeCount,
-        'progressMs': progressMs,
-        'lastWatchAt': lastWatchAt?.toIso8601String(),
-        'kazumiSource': kazumiSource,
-        'updatedAt': updatedAt.toIso8601String(),
-        'deleted': deleted,
-      };
+    'schemaVersion': 1,
+    'id': id,
+    'bangumiId': bangumiId,
+    'title': title,
+    'originalTitle': originalTitle,
+    'summary': summary,
+    'coverUrl': coverUrl,
+    'kind': kind.name,
+    'status': status.name,
+    'firstWatchDate': firstWatchDate?.toIso8601String(),
+    'finishDate': finishDate?.toIso8601String(),
+    'dropDate': dropDate?.toIso8601String(),
+    'rewatchDates': rewatchDates.map((e) => e.toIso8601String()).toList(),
+    'rating': rating,
+    'favorite': favorite,
+    'notes': notes,
+    'episode': episode,
+    'episodeCount': episodeCount,
+    'episodeCountManual': episodeCountManual,
+    'ovaOverride': ovaOverride,
+    'progressMs': progressMs,
+    'lastWatchAt': lastWatchAt?.toIso8601String(),
+    'kazumiSource': kazumiSource,
+    'updatedAt': updatedAt.toIso8601String(),
+    'deleted': deleted,
+  };
 
-  static DateTime? _date(dynamic value) => value is String && value.isNotEmpty
-      ? DateTime.tryParse(value)
-      : null;
+  static DateTime? _date(dynamic value) =>
+      value is String && value.isNotEmpty ? DateTime.tryParse(value) : null;
 
   factory WatchEntry.fromJson(Map<String, dynamic> json) {
-    if (json['schemaVersion'] != 1) throw const FormatException('Unsupported MT record');
+    if (json['schemaVersion'] != 1) {
+      throw const FormatException('Unsupported MT record');
+    }
     return WatchEntry(
       id: json['id'] as String,
       bangumiId: (json['bangumiId'] as num?)?.toInt(),
@@ -149,22 +167,28 @@ class WatchEntry {
       finishDate: _date(json['finishDate']),
       dropDate: _date(json['dropDate']),
       rewatchDates: (json['rewatchDates'] as List? ?? const [])
-          .map(_date).whereType<DateTime>().toList(),
+          .map(_date)
+          .whereType<DateTime>()
+          .toList(),
       rating: (json['rating'] as num?)?.toDouble(),
       favorite: json['favorite'] == true,
       notes: json['notes'] as String? ?? '',
       episode: (json['episode'] as num?)?.toInt(),
       episodeCount: (json['episodeCount'] as num?)?.toInt(),
+      episodeCountManual:
+          json['episodeCountManual'] as bool? ?? json['episodeCount'] != null,
+      ovaOverride: json['ovaOverride'] as bool?,
       progressMs: (json['progressMs'] as num?)?.toInt(),
       lastWatchAt: _date(json['lastWatchAt']),
       kazumiSource: json['kazumiSource'] as String? ?? '',
-      updatedAt: _date(json['updatedAt']) ?? DateTime.fromMillisecondsSinceEpoch(0),
+      updatedAt:
+          _date(json['updatedAt']) ?? DateTime.fromMillisecondsSinceEpoch(0),
       deleted: json['deleted'] == true,
     );
   }
 }
 
 String encodeEntries(Iterable<WatchEntry> entries) => jsonEncode({
-      'schemaVersion': 1,
-      'entries': entries.map((e) => e.toJson()).toList(),
-    });
+  'schemaVersion': 1,
+  'entries': entries.map((e) => e.toJson()).toList(),
+});

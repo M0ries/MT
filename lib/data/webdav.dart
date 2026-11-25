@@ -9,6 +9,12 @@ class DavCredentials {
   final String password;
 }
 
+class DavResource {
+  const DavResource(this.name, this.version);
+  final String name;
+  final String? version;
+}
+
 class WebDavClient {
   WebDavClient(DavCredentials credentials)
     : _credentials = credentials,
@@ -17,7 +23,9 @@ class WebDavClient {
   final DavCredentials _credentials;
   final Uri _base;
   final HttpClient _http = HttpClient()
-    ..connectionTimeout = const Duration(seconds: 15);
+    ..connectionTimeout = const Duration(seconds: 15)
+    ..idleTimeout = const Duration(seconds: 15)
+    ..maxConnectionsPerHost = 6;
 
   static Uri _validateBase(String value) {
     final uri = Uri.tryParse(value.trim());
@@ -80,7 +88,6 @@ class WebDavClient {
     final request = await _http
         .openUrl(method, url(path))
         .timeout(const Duration(seconds: 20));
-    request.persistentConnection = false;
     request.headers.set(
       HttpHeaders.authorizationHeader,
       'Basic ${base64Encode(utf8.encode('${_credentials.username}:${_credentials.password}'))}',
@@ -166,32 +173,50 @@ class WebDavClient {
     }
   }
 
-  Future<List<String>> listFiles(String path) async {
+  Future<List<String>> listFiles(String path) async =>
+      (await listResources(path)).map((item) => item.name).toList();
+
+  Future<List<DavResource>> listResources(String path) async {
     final xml = (await _readText(
       'PROPFIND',
       path,
       action: '列出 $path',
-      body: '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>',
+      body: '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getetag/><d:getlastmodified/></d:prop></d:propfind>',
       headers: {
         'Depth': '1',
         HttpHeaders.contentTypeHeader: 'application/xml; charset=utf-8',
       },
     ))!;
-    final hrefs = RegExp(
-      r'<(?:[\w.-]+:)?href[^>]*>([^<]+)</(?:[\w.-]+:)?href>',
-      caseSensitive: false,
-    ).allMatches(xml).map((m) => m.group(1)!).toList();
     final basePath = Uri.decodeComponent(url(path).path)
         .replaceAll(RegExp(r'/$'), '');
-    return hrefs
-        .map((s) => s.replaceAll('&amp;', '&'))
-        .map((s) => Uri.tryParse(s))
-        .whereType<Uri>()
-        .map((u) => Uri.decodeComponent(u.path))
-        .where((p) => p.startsWith('$basePath/') && !p.endsWith('/'))
-        .map((p) => p.substring(basePath.length + 1))
-        .where((p) => !p.contains('/'))
-        .toList();
+    final resources = <DavResource>[];
+    final responses = RegExp(
+      r'<(?:[\w.-]+:)?response(?:\s[^>]*)?>[\s\S]*?</(?:[\w.-]+:)?response>',
+      caseSensitive: false,
+    ).allMatches(xml);
+    String? property(String block, String name) => RegExp(
+      '<(?:[\\w.-]+:)?$name(?:\\s[^>]*)?>([^<]*)</(?:[\\w.-]+:)?$name>',
+      caseSensitive: false,
+    ).firstMatch(block)?.group(1)?.replaceAll('&amp;', '&');
+    for (final response in responses) {
+      final block = response.group(0)!;
+      final href = property(block, 'href');
+      if (href == null) continue;
+      final uri = Uri.tryParse(href);
+      if (uri == null) continue;
+      final resourcePath = Uri.decodeComponent(uri.path);
+      if (!resourcePath.startsWith('$basePath/') || resourcePath.endsWith('/')) {
+        continue;
+      }
+      final name = resourcePath.substring(basePath.length + 1);
+      if (name.contains('/')) continue;
+      final etag = property(block, 'getetag');
+      final modified = property(block, 'getlastmodified');
+      resources.add(
+        DavResource(name, etag?.isNotEmpty == true ? etag : modified),
+      );
+    }
+    return resources;
   }
 
   void close() => _http.close(force: true);

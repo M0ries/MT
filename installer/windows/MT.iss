@@ -1,7 +1,7 @@
 [Setup]
 AppId=app.memorytaker.MT
 AppName=MT - Memory Taker
-AppVersion=1.0.5
+AppVersion=1.1.0
 AppPublisher=MT contributors
 DefaultDirName={localappdata}\Programs\MT
 DefaultGroupName=MT

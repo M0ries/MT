@@ -1,13 +1,16 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:package_info_plus/package_info_plus.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'data/bangumi.dart';
+import 'data/content_cache.dart';
 import 'data/dav_password_store.dart';
 import 'data/external_import.dart';
 import 'data/journal_store.dart';
@@ -128,7 +131,7 @@ String _statusName(WatchStatus status) => switch (status) {
   WatchStatus.dropped => '弃坑',
 };
 String _kindName(WatchKind kind) => switch (kind) {
-  WatchKind.anime => '动画',
+  WatchKind.anime => '动漫',
   WatchKind.movie => '电影',
   WatchKind.series => '剧集',
 };
@@ -139,6 +142,50 @@ String _duration(int? ms) {
   if (ms == null || ms <= 0) return '';
   final d = Duration(milliseconds: ms);
   return '${d.inHours.toString().padLeft(2, '0')}:${(d.inMinutes % 60).toString().padLeft(2, '0')}:${(d.inSeconds % 60).toString().padLeft(2, '0')}';
+}
+
+enum LibrarySort { updated, firstWatch, finish, lastWatch, title }
+
+String _sortName(LibrarySort sort) => switch (sort) {
+  LibrarySort.updated => '最近修改',
+  LibrarySort.firstWatch => '开始日期',
+  LibrarySort.finish => '结束日期',
+  LibrarySort.lastWatch => '最近观看',
+  LibrarySort.title => '作品名称',
+};
+
+int _compareEntries(
+  WatchEntry a,
+  WatchEntry b,
+  LibrarySort sort,
+  bool descending,
+) {
+  if (sort == LibrarySort.title) {
+    final result = a.title.compareTo(b.title);
+    return result == 0
+        ? a.id.compareTo(b.id)
+        : descending
+        ? -result
+        : result;
+  }
+  DateTime? value(WatchEntry entry) => switch (sort) {
+    LibrarySort.updated => entry.updatedAt,
+    LibrarySort.firstWatch => entry.firstWatchDate,
+    LibrarySort.finish =>
+      entry.status == WatchStatus.dropped ? entry.dropDate : entry.finishDate,
+    LibrarySort.lastWatch => entry.lastWatchAt,
+    LibrarySort.title => null,
+  };
+  final first = value(a), second = value(b);
+  if (first == null && second == null) return a.title.compareTo(b.title);
+  if (first == null) return 1;
+  if (second == null) return -1;
+  final result = first.compareTo(second);
+  return result == 0
+      ? a.title.compareTo(b.title)
+      : descending
+      ? -result
+      : result;
 }
 
 class HomePage extends StatefulWidget {
@@ -165,6 +212,8 @@ class _HomePageState extends State<HomePage> {
   int page = 0;
   WatchStatus? filter;
   String query = '';
+  LibrarySort sort = LibrarySort.updated;
+  bool sortDescending = true;
   late String mtPassword;
   late String kazumiPassword;
   late String updateToken;
@@ -187,6 +236,11 @@ class _HomePageState extends State<HomePage> {
     mtPassword = widget.initialMtPassword;
     kazumiPassword = widget.initialKazumiPassword;
     updateToken = widget.initialUpdateToken;
+    sort = LibrarySort.values.firstWhere(
+      (value) => value.name == widget.store.getString('library.sort'),
+      orElse: () => LibrarySort.updated,
+    );
+    sortDescending = widget.store.getString('library.descending') != 'false';
     widget.store.addListener(_refresh);
     timer = Timer.periodic(
       const Duration(minutes: 10),
@@ -405,11 +459,21 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _syncOnce() async {
-    if (widget.store.getString('kazumi.url').isNotEmpty) {
+    if (widget.store.getString('kazumi.url').isNotEmpty &&
+        widget.store.getString('kazumi.autoSync') != 'false') {
       await _run(
         () => const KazumiImportService().import(
           widget.store,
           _credentials('kazumi', kazumiPassword),
+          onProgress: (phase, done, total) {
+            if (mounted) {
+              setState(
+                () => _syncStatus['kazumi'] = total > 0
+                    ? '$phase $done/$total'
+                    : phase,
+              );
+            }
+          },
         ),
         quiet: true,
         syncKey: 'kazumi',
@@ -419,11 +483,21 @@ class _HomePageState extends State<HomePage> {
       _autoSyncPending = true;
       return;
     }
-    if (widget.store.getString('mt.url').isNotEmpty) {
+    if (widget.store.getString('mt.url').isNotEmpty &&
+        widget.store.getString('mt.autoSync') != 'false') {
       await _run(
         () => const MtSyncService().sync(
           widget.store,
           _credentials('mt', mtPassword),
+          onProgress: (phase, done, total) {
+            if (mounted) {
+              setState(
+                () => _syncStatus['mt'] = total > 0
+                    ? '$phase $done/$total'
+                    : phase,
+              );
+            }
+          },
         ),
         quiet: true,
         syncKey: 'mt',
@@ -485,7 +559,83 @@ class _HomePageState extends State<HomePage> {
     );
     if (result != null) {
       await widget.store.put(result);
+      if (result.deleted && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('已删除「${result.title}」'),
+            action: SnackBarAction(
+              label: '撤销',
+              onPressed: () async {
+                if (entry == null) return;
+                await widget.store.put(entry.copyWith(deleted: false));
+                unawaited(_backgroundSync());
+              },
+            ),
+          ),
+        );
+      }
       await _backgroundSync();
+    }
+  }
+
+  Future<void> _exportRecords() async {
+    final records = widget.store.entries;
+    final today = DateTime.now();
+    final name =
+        'MT-backup-${today.year}-${today.month.toString().padLeft(2, '0')}-${today.day.toString().padLeft(2, '0')}-${records.length}.json';
+    try {
+      final contents = encodeEntries(records);
+      if (Platform.isIOS) {
+        final directory = await getApplicationDocumentsDirectory();
+        final destination = '${directory.path}${Platform.pathSeparator}$name';
+        await File(destination).writeAsString(contents, flush: true);
+      } else {
+        final location = await getSaveLocation(
+          suggestedName: name,
+          acceptedTypeGroups: const [_importFiles],
+        );
+        if (location == null) return;
+        await XFile.fromData(
+          Uint8List.fromList(utf8.encode(contents)),
+          mimeType: 'application/json',
+          name: name,
+        ).saveTo(location.path);
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              Platform.isIOS
+                  ? '已导出 ${records.length} 条记录，可在“文件 → 我的 iPhone/iPad → MT”找到'
+                  : '已导出 ${records.length} 条记录',
+            ),
+          ),
+        );
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('导出失败：$error')));
+      }
+    }
+  }
+
+  Future<void> _clearContentCache() async {
+    try {
+      await ContentCache.instance.clear();
+      imageCache.clear();
+      imageCache.clearLiveImages();
+      if (mounted) {
+        setState(() {});
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('已清除封面与 Bangumi 内容缓存，追番记录仍保留')),
+        );
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('清除缓存失败：$error')));
+      }
     }
   }
 
@@ -705,6 +855,7 @@ class _HomePageState extends State<HomePage> {
                       .contains(query.toLowerCase())),
         )
         .toList();
+    entries.sort((a, b) => _compareEntries(a, b, sort, sortDescending));
     return Center(
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 1180),
@@ -721,11 +872,65 @@ class _HomePageState extends State<HomePage> {
                           ?.copyWith(fontWeight: FontWeight.bold),
                     ),
                   ),
+                  PopupMenuButton<LibrarySort>(
+                    tooltip: '按时间排序',
+                    icon: const Icon(Icons.sort),
+                    initialValue: sort,
+                    onSelected: (value) {
+                      setState(() => sort = value);
+                      unawaited(
+                        widget.store.setString('library.sort', value.name),
+                      );
+                    },
+                    itemBuilder: (_) => [
+                      for (final value in LibrarySort.values)
+                        PopupMenuItem(
+                          value: value,
+                          child: Text(_sortName(value)),
+                        ),
+                    ],
+                  ),
+                  IconButton(
+                    tooltip: sortDescending ? '当前：从新到旧，点击反转' : '当前：从旧到新，点击反转',
+                    icon: Icon(
+                      sortDescending
+                          ? Icons.arrow_downward
+                          : Icons.arrow_upward,
+                    ),
+                    onPressed: () {
+                      setState(() => sortDescending = !sortDescending);
+                      unawaited(
+                        widget.store.setString(
+                          'library.descending',
+                          sortDescending.toString(),
+                        ),
+                      );
+                    },
+                  ),
                   if (widget.store.getString('mt.url').isNotEmpty)
                     IconButton(
                       tooltip: '同步 MT',
                       icon: const Icon(Icons.sync),
-                      onPressed: () => unawaited(_backgroundSync()),
+                      onPressed: busy
+                          ? null
+                          : () => unawaited(
+                              _run(
+                                () => const MtSyncService().sync(
+                                  widget.store,
+                                  _credentials('mt', mtPassword),
+                                  onProgress: (phase, done, total) {
+                                    if (mounted) {
+                                      setState(
+                                        () => _syncStatus['mt'] = total > 0
+                                            ? '$phase $done/$total'
+                                            : phase,
+                                      );
+                                    }
+                                  },
+                                ),
+                                syncKey: 'mt',
+                              ),
+                            ),
                     ),
                 ],
               ),
@@ -852,17 +1057,43 @@ class _HomePageState extends State<HomePage> {
                   ),
                   const SizedBox(height: 6),
                   Text(
-                    '${_kindName(item.kind)} · ${_statusName(item.status)}',
+                    '${_kindName(item.kind)}${item.isOva ? ' · OVA' : ''} · ${_statusName(item.status)}',
                     style: TextStyle(
                       color: Theme.of(context).colorScheme.primary,
                     ),
                   ),
                   const Spacer(),
-                  if (item.episode != null)
+                  if (item.status == WatchStatus.watching &&
+                      item.episode != null)
                     Text(
-                      '看到第 ${item.episode} 集${_duration(item.progressMs).isEmpty ? '' : ' · ${_duration(item.progressMs)}'}',
+                      '看到第 ${item.episode} 集${item.episodeCount == null ? '' : ' / ${item.episodeCount} 集'}${_duration(item.progressMs).isEmpty ? '' : ' · ${_duration(item.progressMs)}'}',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: Colors.blueGrey.shade600,
+                        fontSize: 12,
+                      ),
+                    ),
+                  if (item.status == WatchStatus.completed ||
+                      item.status == WatchStatus.dropped) ...[
+                    Text(
+                      '开始：${_date(item.firstWatchDate)}',
+                      style: TextStyle(
+                        color: Colors.blueGrey.shade600,
+                        fontSize: 12,
+                      ),
+                    ),
+                    Text(
+                      '${item.status == WatchStatus.completed ? '结束' : '弃坑'}：${_date(item.status == WatchStatus.completed ? item.finishDate : item.dropDate)}',
+                      style: TextStyle(
+                        color: Colors.blueGrey.shade600,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                  if (item.status == WatchStatus.paused)
+                    Text(
+                      '开始：${_date(item.firstWatchDate)}',
                       style: TextStyle(
                         color: Colors.blueGrey.shade600,
                         fontSize: 12,
@@ -985,6 +1216,11 @@ class _HomePageState extends State<HomePage> {
                         icon: const Icon(Icons.history_outlined),
                         label: const Text('导入 Kazumi 文件'),
                       ),
+                      OutlinedButton.icon(
+                        onPressed: _exportRecords,
+                        icon: const Icon(Icons.ios_share_outlined),
+                        label: const Text('导出 MT JSON'),
+                      ),
                     ],
                   ),
                   const SizedBox(height: 8),
@@ -993,6 +1229,16 @@ class _HomePageState extends State<HomePage> {
                   ),
                 ],
               ),
+            ),
+          ),
+          const SizedBox(height: 16),
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.cleaning_services_outlined),
+              title: const Text('清除内容缓存'),
+              subtitle: const Text('删除本机封面和 Bangumi 搜索缓存；追番记录不会删除'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: _clearContentCache,
             ),
           ),
           const SizedBox(height: 16),
@@ -1005,6 +1251,15 @@ class _HomePageState extends State<HomePage> {
               () => const MtSyncService().sync(
                 widget.store,
                 _credentials('mt', mtPassword),
+                onProgress: (phase, done, total) {
+                  if (mounted) {
+                    setState(
+                      () => _syncStatus['mt'] = total > 0
+                          ? '$phase $done/$total'
+                          : phase,
+                    );
+                  }
+                },
               ),
               syncKey: 'mt',
             ),
@@ -1019,6 +1274,15 @@ class _HomePageState extends State<HomePage> {
               () => const KazumiImportService().import(
                 widget.store,
                 _credentials('kazumi', kazumiPassword),
+                onProgress: (phase, done, total) {
+                  if (mounted) {
+                    setState(
+                      () => _syncStatus['kazumi'] = total > 0
+                          ? '$phase $done/$total'
+                          : phase,
+                    );
+                  }
+                },
               ),
               syncKey: 'kazumi',
             ),
@@ -1028,7 +1292,7 @@ class _HomePageState extends State<HomePage> {
             child: Padding(
               padding: EdgeInsets.all(16),
               child: Text(
-                '同一台设备连接后，MT 每 10 分钟读取一次 Kazumi 历史并同步 MT。'
+                '启用自动同步后，MT 每 10 分钟检查一次对应的 WebDAV 数据。'
                 '首次连接请先执行一次导入或同步。Kazumi 的旧版 Hive 二进制备份暂不支持直接读取。',
               ),
             ),
@@ -1143,6 +1407,15 @@ class _HomePageState extends State<HomePage> {
                   ?.copyWith(fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 12),
+            SwitchListTile.adaptive(
+              contentPadding: EdgeInsets.zero,
+              title: Text(prefix == 'mt' ? '自动同步 MT' : '自动导入 Kazumi'),
+              subtitle: const Text('关闭后仍可使用下方按钮手动操作'),
+              value: widget.store.getString('$prefix.autoSync') != 'false',
+              onChanged: (value) =>
+                  widget.store.setString('$prefix.autoSync', value.toString()),
+            ),
+            const SizedBox(height: 8),
             TextFormField(
               initialValue: widget.store.getString('$prefix.url'),
               decoration: const InputDecoration(
@@ -1216,13 +1489,21 @@ class Poster extends StatelessWidget {
                 color: Colors.blueGrey.shade300,
               ),
             )
-          : Image.network(
-              url,
-              fit: BoxFit.cover,
-              errorBuilder: (_, _, _) => const ColoredBox(
-                color: Color(0xFFE7EBF5),
-                child: Icon(Icons.movie_outlined),
-              ),
+          : FutureBuilder<File?>(
+              future: ContentCache.instance.cover(url),
+              builder: (context, snapshot) => snapshot.data == null
+                  ? const ColoredBox(
+                      color: Color(0xFFE7EBF5),
+                      child: Icon(Icons.movie_outlined),
+                    )
+                  : Image.file(
+                      snapshot.data!,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, _, _) => const ColoredBox(
+                        color: Color(0xFFE7EBF5),
+                        child: Icon(Icons.movie_outlined),
+                      ),
+                    ),
             ),
     ),
   );
@@ -1355,6 +1636,9 @@ class _EntryEditorState extends State<EntryEditor> {
   late WatchKind kind;
   late WatchStatus status;
   late bool favorite;
+  late bool episodeCountManual;
+  bool? ovaOverride;
+  bool refreshingEpisodeCount = false;
   double? rating;
   DateTime? first, finish, drop;
   late List<DateTime> rewatches;
@@ -1374,11 +1658,37 @@ class _EntryEditorState extends State<EntryEditor> {
     kind = e?.kind ?? WatchKind.anime;
     status = e?.status ?? WatchStatus.planned;
     favorite = e?.favorite ?? false;
+    episodeCountManual = e?.episodeCountManual ?? false;
+    ovaOverride = e?.ovaOverride;
     rating = e?.rating;
     first = e?.firstWatchDate;
     finish = e?.finishDate;
     drop = e?.dropDate;
     rewatches = [...?e?.rewatchDates];
+    if (e?.bangumiId != null && !episodeCountManual) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_refreshEpisodeCount());
+      });
+    }
+  }
+
+  Future<void> _refreshEpisodeCount() async {
+    final id = widget.entry?.bangumiId;
+    if (id == null || refreshingEpisodeCount) return;
+    setState(() => refreshingEpisodeCount = true);
+    try {
+      final subject = await BangumiClient().detail(id);
+      if (mounted && subject.episodeCount > 0 && !episodeCountManual) {
+        setState(() => episodeCount.text = subject.episodeCount.toString());
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Bangumi 集数更新失败：$error')));
+      }
+    } finally {
+      if (mounted) setState(() => refreshingEpisodeCount = false);
+    }
   }
 
   @override
@@ -1445,6 +1755,8 @@ class _EntryEditorState extends State<EntryEditor> {
         notes: notes.text.trim(),
         episode: int.tryParse(episode.text),
         episodeCount: int.tryParse(episodeCount.text),
+        episodeCountManual: old?.bangumiId == null || episodeCountManual,
+        ovaOverride: ovaOverride,
         progressMs: old?.progressMs,
         lastWatchAt: old?.lastWatchAt,
         kazumiSource: old?.kazumiSource ?? '',
@@ -1549,6 +1861,27 @@ class _EntryEditorState extends State<EntryEditor> {
                 ],
               ),
               const SizedBox(height: 8),
+              DropdownButtonFormField<String>(
+                initialValue: ovaOverride == null
+                    ? 'auto'
+                    : ovaOverride!
+                    ? 'yes'
+                    : 'no',
+                decoration: const InputDecoration(labelText: 'OVA 标签'),
+                items: const [
+                  DropdownMenuItem(value: 'auto', child: Text('自动识别标题')),
+                  DropdownMenuItem(value: 'yes', child: Text('标记为 OVA')),
+                  DropdownMenuItem(value: 'no', child: Text('不显示 OVA')),
+                ],
+                onChanged: (value) => setState(
+                  () => ovaOverride = switch (value) {
+                    'yes' => true,
+                    'no' => false,
+                    _ => null,
+                  },
+                ),
+              ),
+              const SizedBox(height: 8),
               SwitchListTile(
                 contentPadding: EdgeInsets.zero,
                 value: favorite,
@@ -1599,6 +1932,8 @@ class _EntryEditorState extends State<EntryEditor> {
                   Expanded(
                     child: TextFormField(
                       controller: episodeCount,
+                      onChanged: (_) =>
+                          setState(() => episodeCountManual = true),
                       keyboardType: TextInputType.number,
                       inputFormatters: [FilteringTextInputFormatter.digitsOnly],
                       decoration: const InputDecoration(labelText: '总集数'),
@@ -1606,6 +1941,23 @@ class _EntryEditorState extends State<EntryEditor> {
                   ),
                 ],
               ),
+              if (widget.entry?.bangumiId != null)
+                SwitchListTile.adaptive(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('从 Bangumi 同步总集数'),
+                  subtitle: Text(
+                    episodeCountManual
+                        ? '已使用自定义集数'
+                        : refreshingEpisodeCount
+                        ? '正在更新集数…'
+                        : '可随时改为自定义',
+                  ),
+                  value: !episodeCountManual,
+                  onChanged: (value) {
+                    setState(() => episodeCountManual = !value);
+                    if (value) unawaited(_refreshEpisodeCount());
+                  },
+                ),
               if (widget.entry?.progressMs != null)
                 Padding(
                   padding: const EdgeInsets.only(top: 8),

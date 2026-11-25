@@ -1,4 +1,8 @@
 import 'dart:convert';
+import 'dart:io';
+
+import 'package:crypto/crypto.dart';
+import 'package:path_provider/path_provider.dart';
 
 import '../model/watch_entry.dart';
 import 'journal_store.dart';
@@ -7,22 +11,79 @@ import 'webdav.dart';
 class KazumiImportService {
   const KazumiImportService();
 
-  Future<int> import(JournalStore store, DavCredentials credentials) async {
+  Future<int> import(
+    JournalStore store,
+    DavCredentials credentials, {
+    void Function(String phase, int done, int total)? onProgress,
+    Directory? cacheDirectory,
+  }) async {
     final client = WebDavClient(credentials);
     try {
+      onProgress?.call('读取 Kazumi 快照', 0, 0);
       final raw = await client.read('kazumiSync/history/snapshot.json');
-      List<String> files;
+      List<DavResource> files;
       try {
-        files = await client.listFiles('kazumiSync/history/changes/');
+        files = await client.listResources('kazumiSync/history/changes/');
       } catch (_) {
         files = const [];
       }
-      final changeLogs = <String>[];
-      for (final file in files.where((f) => f.endsWith('.jsonl'))) {
-        final text = await client.read('kazumiSync/history/changes/$file');
-        if (text != null) changeLogs.add(text);
+      final directory = cacheDirectory ?? await getApplicationCacheDirectory();
+      final key = sha256
+          .convert(
+            utf8.encode(
+              '${credentials.url.trim()}\n${credentials.username.trim()}',
+            ),
+          )
+          .toString();
+      final cache = File(
+        '${directory.path}${Platform.pathSeparator}kazumi-changes-$key.json',
+      );
+      final previous = <String, Map<String, dynamic>>{};
+      if (await cache.exists()) {
+        try {
+          final data = jsonDecode(await cache.readAsString()) as Map;
+          for (final entry in (data['files'] as Map).entries) {
+            previous[entry.key as String] = Map<String, dynamic>.from(
+              entry.value as Map,
+            );
+          }
+        } catch (_) {}
       }
-      return await importLocal(store, snapshot: raw, changeLogs: changeLogs);
+      final changeLogs = <String>[];
+      final next = <String, Map<String, dynamic>>{};
+      final logs = files.where((item) => item.name.endsWith('.jsonl')).toList();
+      for (var offset = 0; offset < logs.length; offset += 6) {
+        final batch = logs.skip(offset).take(6).toList();
+        final contents = await Future.wait(
+          batch.map((file) async {
+            final cached = previous[file.name];
+            if (file.version != null &&
+                cached?['version'] == file.version &&
+                cached?['text'] is String) {
+              return cached!['text'] as String;
+            }
+            return client.read('kazumiSync/history/changes/${file.name}');
+          }),
+        );
+        for (var i = 0; i < batch.length; i++) {
+          final text = contents[i];
+          if (text == null) continue;
+          changeLogs.add(text);
+          next[batch[i].name] = {'version': batch[i].version, 'text': text};
+        }
+        onProgress?.call('读取 Kazumi 变更', offset + batch.length, logs.length);
+      }
+      final imported = await importLocal(
+        store,
+        snapshot: raw,
+        changeLogs: changeLogs,
+      );
+      await directory.create(recursive: true);
+      final temporary = File('${cache.path}.tmp');
+      await temporary.writeAsString(jsonEncode({'files': next}), flush: true);
+      if (Platform.isWindows && await cache.exists()) await cache.delete();
+      await temporary.rename(cache.path);
+      return imported;
     } finally {
       client.close();
     }
