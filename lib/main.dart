@@ -558,23 +558,50 @@ class _HomePageState extends State<HomePage> {
       MaterialPageRoute(builder: (_) => EntryEditor(entry: entry)),
     );
     if (result != null) {
-      await widget.store.put(result);
-      if (result.deleted && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('已删除「${result.title}」'),
-            action: SnackBarAction(
-              label: '撤销',
-              onPressed: () async {
-                if (entry == null) return;
-                await widget.store.put(entry.copyWith(deleted: false));
-                unawaited(_backgroundSync());
-              },
-            ),
+      await _applyEntry(result, original: entry);
+    }
+  }
+
+  Future<void> _applyEntry(WatchEntry result, {WatchEntry? original}) async {
+    await widget.store.put(result);
+    if (result.deleted && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('已删除「${result.title}」'),
+          action: SnackBarAction(
+            label: '撤销',
+            onPressed: () async {
+              if (original == null) return;
+              await widget.store.put(original.copyWith(deleted: false));
+              unawaited(_backgroundSync());
+            },
           ),
-        );
-      }
-      await _backgroundSync();
+        ),
+      );
+    }
+    await _backgroundSync();
+  }
+
+  Future<void> _deleteEntry(WatchEntry entry) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('删除这条记录？'),
+        content: Text('「${entry.title}」的删除会同步到其他 MT 设备。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true && mounted) {
+      await _applyEntry(entry.copyWith(deleted: true), original: entry);
     }
   }
 
@@ -1053,6 +1080,17 @@ class _HomePageState extends State<HomePage> {
                           color: Color(0xFFE57373),
                           size: 19,
                         ),
+                      PopupMenuButton<String>(
+                        tooltip: '记录操作',
+                        padding: EdgeInsets.zero,
+                        icon: const Icon(Icons.more_vert, size: 19),
+                        onSelected: (value) {
+                          if (value == 'delete') unawaited(_deleteEntry(item));
+                        },
+                        itemBuilder: (_) => const [
+                          PopupMenuItem(value: 'delete', child: Text('删除记录')),
+                        ],
+                      ),
                     ],
                   ),
                   const SizedBox(height: 6),
