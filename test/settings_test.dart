@@ -52,7 +52,6 @@ void main() {
         passwords: DavPasswordStore(),
         mtPassword: '',
         kazumiPassword: '',
-        updateToken: '',
         currentVersion: '1.0.3',
       ),
     );
@@ -60,10 +59,12 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('应用更新'), findsOneWidget);
     expect(find.text('检查更新'), findsOneWidget);
+    expect(find.textContaining('GitHub 访问令牌'), findsNothing);
+    expect(find.text('青绿'), findsNothing);
     final before = Theme.of(tester.element(find.text('主题颜色')))
         .colorScheme
         .primary;
-    await tester.tap(find.widgetWithText(ChoiceChip, '青绿'));
+    await tester.tap(find.byTooltip('青绿'));
     await tester.pumpAndSettle();
 
     expect(store.getString('appearance.accent'), 'teal');

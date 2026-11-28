@@ -10,6 +10,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'data/bangumi.dart';
+import 'data/bangumi_metadata_sync.dart';
 import 'data/content_cache.dart';
 import 'data/dav_password_store.dart';
 import 'data/external_import.dart';
@@ -26,7 +27,6 @@ void main() async {
   final passwords = DavPasswordStore();
   final mtPassword = await passwords.read('mt');
   final kazumiPassword = await passwords.read('kazumi');
-  final updateToken = await passwords.readUpdateToken();
   final currentVersion = (await PackageInfo.fromPlatform()).version;
   runApp(
     MemoryTaker(
@@ -34,7 +34,6 @@ void main() async {
       passwords: passwords,
       mtPassword: mtPassword,
       kazumiPassword: kazumiPassword,
-      updateToken: updateToken,
       currentVersion: currentVersion,
     ),
   );
@@ -68,14 +67,12 @@ class MemoryTaker extends StatelessWidget {
     required this.passwords,
     required this.mtPassword,
     required this.kazumiPassword,
-    required this.updateToken,
     required this.currentVersion,
   });
   final JournalStore store;
   final DavPasswordStore passwords;
   final String mtPassword;
   final String kazumiPassword;
-  final String updateToken;
   final String currentVersion;
 
   @override
@@ -85,7 +82,7 @@ class MemoryTaker extends StatelessWidget {
       final accent = _accentFor(store.getString('appearance.accent'));
       final surface = Color.lerp(const Color(0xFFF7F8FC), accent, 0.045)!;
       return MaterialApp(
-        title: 'MT · Memory Taker',
+        title: 'MRecorder',
         debugShowCheckedModeBanner: false,
         theme: ThemeData(
           useMaterial3: true,
@@ -115,7 +112,6 @@ class MemoryTaker extends StatelessWidget {
           passwords: passwords,
           initialMtPassword: mtPassword,
           initialKazumiPassword: kazumiPassword,
-          initialUpdateToken: updateToken,
           currentVersion: currentVersion,
         ),
       );
@@ -132,12 +128,19 @@ String _statusName(WatchStatus status) => switch (status) {
 };
 String _kindName(WatchKind kind) => switch (kind) {
   WatchKind.anime => '动漫',
+  WatchKind.ova => 'OVA',
   WatchKind.movie => '电影',
   WatchKind.series => '剧集',
 };
-String _date(DateTime? value) => value == null
-    ? '未设置'
-    : '${value.year}-${value.month.toString().padLeft(2, '0')}-${value.day.toString().padLeft(2, '0')}';
+String _date(DateTime? value, [DatePrecision precision = DatePrecision.day]) {
+  if (value == null) return '未设置';
+  final year = value.year.toString();
+  if (precision == DatePrecision.year) return year;
+  final month = value.month.toString().padLeft(2, '0');
+  if (precision == DatePrecision.month) return '$year-$month';
+  return '$year-$month-${value.day.toString().padLeft(2, '0')}';
+}
+
 String _duration(int? ms) {
   if (ms == null || ms <= 0) return '';
   final d = Duration(milliseconds: ms);
@@ -176,13 +179,39 @@ int _compareEntries(
     LibrarySort.lastWatch => entry.lastWatchAt,
     LibrarySort.title => null,
   };
+  DatePrecision precisionOf(WatchEntry entry) => switch (sort) {
+    LibrarySort.firstWatch => entry.firstWatchPrecision,
+    LibrarySort.finish =>
+      entry.status == WatchStatus.dropped
+          ? entry.dropPrecision
+          : entry.finishPrecision,
+    _ => DatePrecision.day,
+  };
   final first = value(a), second = value(b);
-  if (first == null && second == null) return a.title.compareTo(b.title);
+  int tieBreak() {
+    if (a.historyOrder != null && b.historyOrder != null) {
+      final ordered = a.historyOrder!.compareTo(b.historyOrder!);
+      if (ordered != 0) return descending ? -ordered : ordered;
+    }
+    return a.title.compareTo(b.title);
+  }
+
+  if (first == null && second == null) return tieBreak();
   if (first == null) return 1;
   if (second == null) return -1;
+  if (first.year == second.year &&
+      a.historyOrder != null &&
+      b.historyOrder != null &&
+      (precisionOf(a) == DatePrecision.year ||
+          precisionOf(b) == DatePrecision.year ||
+          (first.month == second.month &&
+              (precisionOf(a) == DatePrecision.month ||
+                  precisionOf(b) == DatePrecision.month)))) {
+    return tieBreak();
+  }
   final result = first.compareTo(second);
   return result == 0
-      ? a.title.compareTo(b.title)
+      ? tieBreak()
       : descending
       ? -result
       : result;
@@ -195,14 +224,12 @@ class HomePage extends StatefulWidget {
     required this.passwords,
     required this.initialMtPassword,
     required this.initialKazumiPassword,
-    required this.initialUpdateToken,
     required this.currentVersion,
   });
   final JournalStore store;
   final DavPasswordStore passwords;
   final String initialMtPassword;
   final String initialKazumiPassword;
-  final String initialUpdateToken;
   final String currentVersion;
   @override
   State<HomePage> createState() => _HomePageState();
@@ -212,13 +239,16 @@ class _HomePageState extends State<HomePage> {
   int page = 0;
   WatchStatus? filter;
   String query = '';
+  bool selecting = false;
+  final Set<String> selectedIds = {};
   LibrarySort sort = LibrarySort.updated;
   bool sortDescending = true;
   late String mtPassword;
   late String kazumiPassword;
-  late String updateToken;
   UpdateRelease? availableUpdate;
   bool checkingUpdate = false;
+  bool refreshingBangumi = false;
+  String bangumiRefreshStatus = '';
   bool downloadingUpdate = false;
   int updateReceived = 0;
   int updateTotal = 0;
@@ -235,7 +265,6 @@ class _HomePageState extends State<HomePage> {
     super.initState();
     mtPassword = widget.initialMtPassword;
     kazumiPassword = widget.initialKazumiPassword;
-    updateToken = widget.initialUpdateToken;
     sort = LibrarySort.values.firstWhere(
       (value) => value.name == widget.store.getString('library.sort'),
       orElse: () => LibrarySort.updated,
@@ -248,6 +277,9 @@ class _HomePageState extends State<HomePage> {
     );
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) unawaited(_backgroundSync());
+      if (mounted && widget.store.getString('bangumi.autoRefresh') != 'false') {
+        unawaited(_refreshBangumiMetadata());
+      }
       if (mounted && widget.store.getString('updates.autoCheck') != 'false') {
         unawaited(_checkUpdate(automatic: true));
       }
@@ -265,6 +297,35 @@ class _HomePageState extends State<HomePage> {
     if (mounted) setState(() {});
   }
 
+  Future<void> _refreshBangumiMetadata({bool force = false}) async {
+    if (refreshingBangumi) return;
+    setState(() {
+      refreshingBangumi = true;
+      bangumiRefreshStatus = '准备检查 Bangumi 资料…';
+    });
+    try {
+      final result = await const BangumiMetadataSync().sync(
+        widget.store,
+        force: force,
+        onProgress: (done, total) {
+          if (mounted) {
+            setState(() => bangumiRefreshStatus = '检查 Bangumi 资料 $done/$total');
+          }
+        },
+      );
+      if (!mounted) return;
+      setState(
+        () => bangumiRefreshStatus =
+            '已检查 ${result.checked} 部，更新 ${result.updated} 部${result.failed == 0 ? '' : '，失败 ${result.failed} 部'}',
+      );
+      if (result.updated > 0) unawaited(_backgroundSync());
+    } catch (error) {
+      if (mounted) setState(() => bangumiRefreshStatus = 'Bangumi 刷新失败：$error');
+    } finally {
+      if (mounted) setState(() => refreshingBangumi = false);
+    }
+  }
+
   void _updatePassword(String account, String value) {
     setState(() {
       if (account == 'mt') {
@@ -274,14 +335,6 @@ class _HomePageState extends State<HomePage> {
       }
     });
     _saveSecret(account, () => widget.passwords.write(account, value));
-  }
-
-  void _updateToken(String value) {
-    setState(() => updateToken = value.trim());
-    _saveSecret(
-      'github',
-      () => widget.passwords.writeUpdateToken(value.trim()),
-    );
   }
 
   void _saveSecret(String key, Future<void> Function() write) {
@@ -299,7 +352,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _openReleasePage([Uri? page]) async {
-    final url = page ?? Uri.parse(mtReleasesUrl);
+    final url = page ?? Uri.parse(mRecorderReleasesUrl);
     try {
       if (!await launchUrl(url, mode: LaunchMode.externalApplication)) {
         throw StateError('无法打开浏览器');
@@ -318,7 +371,6 @@ class _HomePageState extends State<HomePage> {
     try {
       final release = await UpdateService().checkLatest(
         currentVersion: widget.currentVersion,
-        token: updateToken,
       );
       if (!mounted) return;
       setState(() => availableUpdate = release);
@@ -404,7 +456,6 @@ class _HomePageState extends State<HomePage> {
       final file = await UpdateService().downloadAsset(
         release,
         asset,
-        token: updateToken,
         onProgress: (received, total) {
           if (mounted) {
             setState(() {
@@ -443,16 +494,16 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _backgroundSync() async {
     _autoSyncPending = true;
-    if (_autoSyncRunning || busy) return;
+    if (_autoSyncRunning || busy || importing) return;
     _autoSyncRunning = true;
     try {
-      while (_autoSyncPending && mounted && !busy) {
+      while (_autoSyncPending && mounted && !busy && !importing) {
         _autoSyncPending = false;
         await _syncOnce();
       }
     } finally {
       _autoSyncRunning = false;
-      if (_autoSyncPending && mounted && !busy) {
+      if (_autoSyncPending && mounted && !busy && !importing) {
         unawaited(_backgroundSync());
       }
     }
@@ -587,7 +638,7 @@ class _HomePageState extends State<HomePage> {
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('删除这条记录？'),
-        content: Text('「${entry.title}」的删除会同步到其他 MT 设备。'),
+        content: Text('「${entry.title}」的删除会同步到其他 MRecorder 设备。'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
@@ -605,11 +656,233 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  Future<void> _exportRecords() async {
-    final records = widget.store.entries;
+  List<WatchEntry> get _selectedEntries => widget.store.entries
+      .where((item) => selectedIds.contains(item.id))
+      .toList();
+
+  void _toggleSelection(String id) {
+    setState(() {
+      if (!selectedIds.add(id)) selectedIds.remove(id);
+    });
+  }
+
+  Future<void> _applyBulk(
+    WatchEntry Function(WatchEntry entry, DateTime updatedAt) change, {
+    bool deleting = false,
+  }) async {
+    final originals = _selectedEntries;
+    if (originals.isEmpty) return;
+    final now = DateTime.now().toUtc();
+    final latest = originals
+        .map((entry) => entry.updatedAt)
+        .reduce((a, b) => a.isAfter(b) ? a : b);
+    final updatedAt = now.isAfter(latest)
+        ? now
+        : latest.add(const Duration(milliseconds: 1));
+    try {
+      await widget.store.putAll(
+        originals.map((entry) => change(entry, updatedAt)),
+      );
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('批量操作失败：$error')));
+      }
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      selectedIds.clear();
+      selecting = false;
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          deleting
+              ? '已删除 ${originals.length} 条记录'
+              : '已更新 ${originals.length} 条记录',
+        ),
+        action: deleting
+            ? SnackBarAction(
+                label: '撤销',
+                onPressed: () async {
+                  final undoneAt = DateTime.now().toUtc();
+                  final restoreAt = undoneAt.isAfter(updatedAt)
+                      ? undoneAt
+                      : updatedAt.add(const Duration(milliseconds: 1));
+                  try {
+                    await widget.store.putAll(
+                      originals.map(
+                        (entry) => entry.copyWith(
+                          deleted: false,
+                          updatedAt: restoreAt,
+                        ),
+                      ),
+                    );
+                    unawaited(_backgroundSync());
+                  } catch (error) {
+                    if (mounted) {
+                      ScaffoldMessenger.of(context)
+                          .showSnackBar(SnackBar(content: Text('撤销失败：$error')));
+                    }
+                  }
+                },
+              )
+            : null,
+      ),
+    );
+    await _backgroundSync();
+  }
+
+  Future<void> _deleteSelected() async {
+    final count = _selectedEntries.length;
+    if (count == 0) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('删除选中的 $count 条记录？'),
+        content: const Text('删除会同步到其他 MRecorder 设备。操作后可立即撤销。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true && mounted) {
+      await _applyBulk(
+        (entry, at) => entry.copyWith(deleted: true, updatedAt: at),
+        deleting: true,
+      );
+    }
+  }
+
+  Future<void> _deleteAllRecords() async {
+    final originals = widget.store.entries;
+    if (originals.isEmpty) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('没有可删除的记录')));
+      return;
+    }
+    var backupCreated = false;
+    while (mounted) {
+      final action = await showDialog<String>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text('删除全部 ${originals.length} 条记录？'),
+          content: Text(
+            '这会删除所有现存记录，与搜索和筛选无关，并在下次 MRecorder 同步时同步到其他设备。${backupCreated ? '备份已导出。' : '建议先导出备份。'}',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, 'cancel'),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(context, 'backup'),
+              child: const Text('导出备份'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(context, 'continue'),
+              child: const Text('继续确认'),
+            ),
+          ],
+        ),
+      );
+      if (action == 'backup') {
+        backupCreated = await _exportRecords();
+        continue;
+      }
+      if (action != 'continue') return;
+      break;
+    }
+    if (!mounted) return;
+    final phrase = TextEditingController();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, update) => AlertDialog(
+          title: const Text('再次确认删除全部记录'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('将删除 ${originals.length} 条记录。请输入“删除全部记录”以确认。'),
+              const SizedBox(height: 12),
+              TextField(
+                controller: phrase,
+                autofocus: true,
+                onChanged: (_) => update(() {}),
+                decoration: const InputDecoration(labelText: '确认文字'),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: phrase.text == '删除全部记录'
+                  ? () => Navigator.pop(context, true)
+                  : null,
+              child: const Text('删除全部'),
+            ),
+          ],
+        ),
+      ),
+    );
+    phrase.dispose();
+    if (confirmed != true || !mounted) return;
+    final current = widget.store.entries;
+    if (current.length != originals.length ||
+        !current.every((entry) => originals.any((old) => old.id == entry.id))) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('记录已发生变化，请重新确认删除数量')));
+      return;
+    }
+    final now = DateTime.now().toUtc();
+    final latest = current
+        .map((entry) => entry.updatedAt)
+        .reduce((a, b) => a.isAfter(b) ? a : b);
+    final updatedAt = now.isAfter(latest)
+        ? now
+        : latest.add(const Duration(milliseconds: 1));
+    try {
+      await widget.store.putAll(
+        current.map(
+          (entry) => entry.copyWith(deleted: true, updatedAt: updatedAt),
+        ),
+      );
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('删除全部失败：$error')));
+      }
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      selectedIds.clear();
+      selecting = false;
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('已删除 ${originals.length} 条记录。可通过“从备份恢复”找回。')),
+    );
+    await _backgroundSync();
+  }
+
+  Future<bool> _exportRecords({Iterable<WatchEntry>? selection}) async {
+    final records = selection?.toList() ?? widget.store.entries;
     final today = DateTime.now();
+    final label = selection == null ? 'backup' : 'selection';
     final name =
-        'MT-backup-${today.year}-${today.month.toString().padLeft(2, '0')}-${today.day.toString().padLeft(2, '0')}-${records.length}.json';
+        'MRecorder-$label-${today.year}-${today.month.toString().padLeft(2, '0')}-${today.day.toString().padLeft(2, '0')}-${records.length}.json';
     try {
       final contents = encodeEntries(records);
       if (Platform.isIOS) {
@@ -621,7 +894,7 @@ class _HomePageState extends State<HomePage> {
           suggestedName: name,
           acceptedTypeGroups: const [_importFiles],
         );
-        if (location == null) return;
+        if (location == null) return false;
         await XFile.fromData(
           Uint8List.fromList(utf8.encode(contents)),
           mimeType: 'application/json',
@@ -633,17 +906,19 @@ class _HomePageState extends State<HomePage> {
           SnackBar(
             content: Text(
               Platform.isIOS
-                  ? '已导出 ${records.length} 条记录，可在“文件 → 我的 iPhone/iPad → MT”找到'
+                  ? '已导出 ${records.length} 条记录，可在“文件”应用中找到'
                   : '已导出 ${records.length} 条记录',
             ),
           ),
         );
       }
+      return true;
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context)
             .showSnackBar(SnackBar(content: Text('导出失败：$error')));
       }
+      return false;
     }
   }
 
@@ -666,25 +941,87 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  Future<void> _importMtFile() async {
-    if (importing) return;
+  Future<void> _importMtFile({
+    bool restoreDeleted = false,
+    bool replaceAll = false,
+  }) async {
+    if (importing || (replaceAll && (busy || _autoSyncRunning))) return;
     setState(() => importing = true);
     try {
       final file = await openFile(acceptedTypeGroups: const [_importFiles]);
       if (file == null) return;
-      await _runLocalImport(
-        () async => const ExternalImportService().importMtJson(
+      if (replaceAll) {
+        if (!mounted) return;
+        final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('用文件替换全部记录？'),
+            content: const Text(
+              '文件里的记录将成为新的完整清单，其他记录会删除。若已启用 MRecorder 同步，替换前会先读取云端记录；同步失败时不会替换。请先导出当前记录作为备份。若只保留此清单，请关闭 Kazumi 自动导入。',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('取消'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('确认替换'),
+              ),
+            ],
+          ),
+        );
+        if (confirmed != true) return;
+      } else if (restoreDeleted) {
+        if (!mounted) return;
+        final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('从备份恢复记录？'),
+            content: const Text(
+              '备份中已删除的记录会重新出现，并在下次 MRecorder 同步时恢复到其他设备。已有的较新记录仍会保留。',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('取消'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('恢复'),
+              ),
+            ],
+          ),
+        );
+        if (confirmed != true) return;
+      }
+      await _runLocalImport(() async {
+        final raw = await file.readAsString();
+        if (replaceAll &&
+            widget.store.getString('mt.url').isNotEmpty &&
+            widget.store.getString('mt.autoSync') != 'false') {
+          await const MtSyncService().sync(
+            widget.store,
+            _credentials('mt', mtPassword),
+          );
+        }
+        return const ExternalImportService().importMtJson(
           widget.store,
-          await file.readAsString(),
-        ),
-      );
+          raw,
+          restoreDeleted: restoreDeleted,
+          replaceAll: replaceAll,
+        );
+      }, replaced: replaceAll);
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context)
             .showSnackBar(SnackBar(content: Text('无法打开文件：$e')));
       }
     } finally {
-      if (mounted) setState(() => importing = false);
+      if (mounted) {
+        setState(() => importing = false);
+        if (_autoSyncPending) unawaited(_backgroundSync());
+      }
     }
   }
 
@@ -723,16 +1060,25 @@ class _HomePageState extends State<HomePage> {
             .showSnackBar(SnackBar(content: Text('无法打开文件：$e')));
       }
     } finally {
-      if (mounted) setState(() => importing = false);
+      if (mounted) {
+        setState(() => importing = false);
+        if (_autoSyncPending) unawaited(_backgroundSync());
+      }
     }
   }
 
-  Future<void> _runLocalImport(Future<int> Function() task) async {
+  Future<void> _runLocalImport(
+    Future<int> Function() task, {
+    bool replaced = false,
+  }) async {
     try {
       final count = await task();
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('已导入 $count 条记录')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(replaced ? '已替换为 $count 条记录' : '已导入 $count 条记录'),
+          ),
+        );
         unawaited(_backgroundSync());
       }
     } catch (error) {
@@ -790,7 +1136,11 @@ class _HomePageState extends State<HomePage> {
             originalTitle: subject.originalTitle,
             summary: subject.summary,
             coverUrl: subject.coverUrl,
-            kind: subject.type == 6 ? WatchKind.series : WatchKind.anime,
+            kind: subject.type == 6
+                ? WatchKind.series
+                : subject.isOva
+                ? WatchKind.ova
+                : WatchKind.anime,
             status: WatchStatus.planned,
             episodeCount: subject.episodeCount,
             updatedAt: DateTime.now().toUtc(),
@@ -807,7 +1157,7 @@ class _HomePageState extends State<HomePage> {
     return Scaffold(
       appBar: AppBar(
         title: const Text(
-          'MT  ·  Memory Taker',
+          'MRecorder',
           style: TextStyle(fontWeight: FontWeight.w700),
         ),
         actions: [
@@ -861,7 +1211,7 @@ class _HomePageState extends State<HomePage> {
                 ),
               ],
             ),
-      floatingActionButton: page == 0
+      floatingActionButton: page == 0 && !selecting
           ? FloatingActionButton.extended(
               onPressed: _add,
               icon: const Icon(Icons.add),
@@ -883,6 +1233,9 @@ class _HomePageState extends State<HomePage> {
         )
         .toList();
     entries.sort((a, b) => _compareEntries(a, b, sort, sortDescending));
+    final allVisibleSelected =
+        entries.isNotEmpty &&
+        entries.every((entry) => selectedIds.contains(entry.id));
     return Center(
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 1180),
@@ -894,78 +1247,116 @@ class _HomePageState extends State<HomePage> {
                 children: [
                   Expanded(
                     child: Text(
-                      '${widget.store.entries.length} 部作品',
+                      selecting
+                          ? '已选 ${selectedIds.length} 条'
+                          : '${widget.store.entries.length} 部作品',
                       style: Theme.of(context).textTheme.titleLarge
                           ?.copyWith(fontWeight: FontWeight.bold),
                     ),
                   ),
-                  PopupMenuButton<LibrarySort>(
-                    tooltip: '按时间排序',
-                    icon: const Icon(Icons.sort),
-                    initialValue: sort,
-                    onSelected: (value) {
-                      setState(() => sort = value);
-                      unawaited(
-                        widget.store.setString('library.sort', value.name),
-                      );
-                    },
-                    itemBuilder: (_) => [
-                      for (final value in LibrarySort.values)
-                        PopupMenuItem(
-                          value: value,
-                          child: Text(_sortName(value)),
-                        ),
-                    ],
-                  ),
-                  IconButton(
-                    tooltip: sortDescending ? '当前：从新到旧，点击反转' : '当前：从旧到新，点击反转',
-                    icon: Icon(
-                      sortDescending
-                          ? Icons.arrow_downward
-                          : Icons.arrow_upward,
-                    ),
-                    onPressed: () {
-                      setState(() => sortDescending = !sortDescending);
-                      unawaited(
-                        widget.store.setString(
-                          'library.descending',
-                          sortDescending.toString(),
-                        ),
-                      );
-                    },
-                  ),
-                  if (widget.store.getString('mt.url').isNotEmpty)
-                    IconButton(
-                      tooltip: '同步 MT',
-                      icon: const Icon(Icons.sync),
-                      onPressed: busy
+                  if (selecting) ...[
+                    TextButton(
+                      onPressed: entries.isEmpty
                           ? null
-                          : () => unawaited(
-                              _run(
-                                () => const MtSyncService().sync(
-                                  widget.store,
-                                  _credentials('mt', mtPassword),
-                                  onProgress: (phase, done, total) {
-                                    if (mounted) {
-                                      setState(
-                                        () => _syncStatus['mt'] = total > 0
-                                            ? '$phase $done/$total'
-                                            : phase,
-                                      );
-                                    }
-                                  },
-                                ),
-                                syncKey: 'mt',
-                              ),
-                            ),
+                          : () => setState(() {
+                              if (allVisibleSelected) {
+                                selectedIds.removeAll(
+                                  entries.map((entry) => entry.id),
+                                );
+                              } else {
+                                selectedIds.addAll(
+                                  entries.map((entry) => entry.id),
+                                );
+                              }
+                            }),
+                      child: Text(allVisibleSelected ? '取消当前选择' : '全选当前结果'),
                     ),
+                    IconButton(
+                      tooltip: '退出批量处理',
+                      icon: const Icon(Icons.close),
+                      onPressed: () => setState(() {
+                        selecting = false;
+                        selectedIds.clear();
+                      }),
+                    ),
+                  ] else
+                    IconButton(
+                      tooltip: '批量处理',
+                      icon: const Icon(Icons.checklist),
+                      onPressed: () => setState(() => selecting = true),
+                    ),
+                  if (!selecting) ...[
+                    PopupMenuButton<LibrarySort>(
+                      tooltip: '按时间排序',
+                      icon: const Icon(Icons.sort),
+                      initialValue: sort,
+                      onSelected: (value) {
+                        setState(() => sort = value);
+                        unawaited(
+                          widget.store.setString('library.sort', value.name),
+                        );
+                      },
+                      itemBuilder: (_) => [
+                        for (final value in LibrarySort.values)
+                          PopupMenuItem(
+                            value: value,
+                            child: Text(_sortName(value)),
+                          ),
+                      ],
+                    ),
+                    IconButton(
+                      tooltip: sortDescending ? '当前：从新到旧，点击反转' : '当前：从旧到新，点击反转',
+                      icon: Icon(
+                        sortDescending
+                            ? Icons.arrow_downward
+                            : Icons.arrow_upward,
+                      ),
+                      onPressed: () {
+                        setState(() => sortDescending = !sortDescending);
+                        unawaited(
+                          widget.store.setString(
+                            'library.descending',
+                            sortDescending.toString(),
+                          ),
+                        );
+                      },
+                    ),
+                    if (widget.store.getString('mt.url').isNotEmpty)
+                      IconButton(
+                        tooltip: '同步 MRecorder',
+                        icon: const Icon(Icons.sync),
+                        onPressed: busy
+                            ? null
+                            : () => unawaited(
+                                _run(
+                                  () => const MtSyncService().sync(
+                                    widget.store,
+                                    _credentials('mt', mtPassword),
+                                    onProgress: (phase, done, total) {
+                                      if (mounted) {
+                                        setState(
+                                          () => _syncStatus['mt'] = total > 0
+                                              ? '$phase $done/$total'
+                                              : phase,
+                                        );
+                                      }
+                                    },
+                                  ),
+                                  syncKey: 'mt',
+                                ),
+                              ),
+                      ),
+                  ],
                 ],
               ),
             ),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
               child: TextField(
-                onChanged: (v) => setState(() => query = v),
+                onChanged: (v) => setState(() {
+                  query = v;
+                  selectedIds.clear();
+                }),
                 decoration: const InputDecoration(
                   prefixIcon: Icon(Icons.search),
                   hintText: '搜索我的记录',
@@ -986,6 +1377,86 @@ class _HomePageState extends State<HomePage> {
                 ],
               ),
             ),
+            if (selecting)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
+                child: selectedIds.isEmpty
+                    ? const Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text('点击记录卡片选择作品'),
+                      )
+                    : Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        crossAxisAlignment: WrapCrossAlignment.center,
+                        children: [
+                          PopupMenuButton<WatchStatus>(
+                            tooltip: '批量修改状态',
+                            onSelected: (value) => unawaited(
+                              _applyBulk(
+                                (entry, at) => entry.copyWith(
+                                  status: value,
+                                  updatedAt: at,
+                                ),
+                              ),
+                            ),
+                            itemBuilder: (_) => [
+                              for (final value in WatchStatus.values)
+                                PopupMenuItem(
+                                  value: value,
+                                  child: Text(_statusName(value)),
+                                ),
+                            ],
+                            child: const Chip(label: Text('修改状态 ▾')),
+                          ),
+                          PopupMenuButton<WatchKind>(
+                            tooltip: '批量修改类型',
+                            onSelected: (value) => unawaited(
+                              _applyBulk(
+                                (entry, at) =>
+                                    entry.copyWith(kind: value, updatedAt: at),
+                              ),
+                            ),
+                            itemBuilder: (_) => [
+                              for (final value in WatchKind.values)
+                                PopupMenuItem(
+                                  value: value,
+                                  child: Text(_kindName(value)),
+                                ),
+                            ],
+                            child: const Chip(label: Text('修改类型 ▾')),
+                          ),
+                          PopupMenuButton<bool>(
+                            tooltip: '批量修改收藏',
+                            onSelected: (value) => unawaited(
+                              _applyBulk(
+                                (entry, at) => entry.copyWith(
+                                  favorite: value,
+                                  updatedAt: at,
+                                ),
+                              ),
+                            ),
+                            itemBuilder: (_) => const [
+                              PopupMenuItem(value: true, child: Text('加入收藏')),
+                              PopupMenuItem(value: false, child: Text('取消收藏')),
+                            ],
+                            child: const Chip(label: Text('收藏 ▾')),
+                          ),
+                          OutlinedButton.icon(
+                            onPressed: () => unawaited(
+                              _exportRecords(selection: _selectedEntries),
+                            ),
+                            icon: const Icon(Icons.ios_share_outlined),
+                            label: const Text('导出所选'),
+                          ),
+                          TextButton.icon(
+                            onPressed: _deleteSelected,
+                            icon: const Icon(Icons.delete_outline),
+                            label: const Text('删除所选'),
+                          ),
+                        ],
+                      ),
+              ),
             Expanded(
               child: entries.isEmpty
                   ? _empty()
@@ -1022,7 +1493,10 @@ class _HomePageState extends State<HomePage> {
     child: ChoiceChip(
       label: Text(label),
       selected: filter == value,
-      onSelected: (_) => setState(() => filter = value),
+      onSelected: (_) => setState(() {
+        filter = value;
+        selectedIds.clear();
+      }),
     ),
   );
 
@@ -1050,12 +1524,25 @@ class _HomePageState extends State<HomePage> {
   Widget _entryCard(WatchEntry item) => Card(
     child: InkWell(
       borderRadius: BorderRadius.circular(16),
-      onTap: () => _edit(item),
+      onTap: () => selecting ? _toggleSelection(item.id) : _edit(item),
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: Row(
           children: [
-            Poster(url: item.coverUrl, width: 82, height: 118),
+            Stack(
+              children: [
+                Poster(url: item.coverUrl, width: 82, height: 118),
+                if (selecting)
+                  Positioned(
+                    top: 0,
+                    left: 0,
+                    child: Checkbox(
+                      value: selectedIds.contains(item.id),
+                      onChanged: (_) => _toggleSelection(item.id),
+                    ),
+                  ),
+              ],
+            ),
             const SizedBox(width: 12),
             Expanded(
               child: Column(
@@ -1080,22 +1567,25 @@ class _HomePageState extends State<HomePage> {
                           color: Color(0xFFE57373),
                           size: 19,
                         ),
-                      PopupMenuButton<String>(
-                        tooltip: '记录操作',
-                        padding: EdgeInsets.zero,
-                        icon: const Icon(Icons.more_vert, size: 19),
-                        onSelected: (value) {
-                          if (value == 'delete') unawaited(_deleteEntry(item));
-                        },
-                        itemBuilder: (_) => const [
-                          PopupMenuItem(value: 'delete', child: Text('删除记录')),
-                        ],
-                      ),
+                      if (!selecting)
+                        PopupMenuButton<String>(
+                          tooltip: '记录操作',
+                          padding: EdgeInsets.zero,
+                          icon: const Icon(Icons.more_vert, size: 19),
+                          onSelected: (value) {
+                            if (value == 'delete') {
+                              unawaited(_deleteEntry(item));
+                            }
+                          },
+                          itemBuilder: (_) => const [
+                            PopupMenuItem(value: 'delete', child: Text('删除记录')),
+                          ],
+                        ),
                     ],
                   ),
                   const SizedBox(height: 6),
                   Text(
-                    '${_kindName(item.kind)}${item.isOva ? ' · OVA' : ''} · ${_statusName(item.status)}',
+                    '${_kindName(item.kind)} · ${_statusName(item.status)}',
                     style: TextStyle(
                       color: Theme.of(context).colorScheme.primary,
                     ),
@@ -1115,14 +1605,14 @@ class _HomePageState extends State<HomePage> {
                   if (item.status == WatchStatus.completed ||
                       item.status == WatchStatus.dropped) ...[
                     Text(
-                      '开始：${_date(item.firstWatchDate)}',
+                      '开始：${_date(item.firstWatchDate, item.firstWatchPrecision)}',
                       style: TextStyle(
                         color: Colors.blueGrey.shade600,
                         fontSize: 12,
                       ),
                     ),
                     Text(
-                      '${item.status == WatchStatus.completed ? '结束' : '弃坑'}：${_date(item.status == WatchStatus.completed ? item.finishDate : item.dropDate)}',
+                      '${item.status == WatchStatus.completed ? '结束' : '弃坑'}：${item.status == WatchStatus.completed ? _date(item.finishDate, item.finishPrecision) : _date(item.dropDate, item.dropPrecision)}',
                       style: TextStyle(
                         color: Colors.blueGrey.shade600,
                         fontSize: 12,
@@ -1131,7 +1621,7 @@ class _HomePageState extends State<HomePage> {
                   ],
                   if (item.status == WatchStatus.paused)
                     Text(
-                      '开始：${_date(item.firstWatchDate)}',
+                      '开始：${_date(item.firstWatchDate, item.firstWatchPrecision)}',
                       style: TextStyle(
                         color: Colors.blueGrey.shade600,
                         fontSize: 12,
@@ -1177,28 +1667,29 @@ class _HomePageState extends State<HomePage> {
                     style: Theme.of(context).textTheme.titleMedium
                         ?.copyWith(fontWeight: FontWeight.bold),
                   ),
-                  const SizedBox(height: 6),
-                  const Text('选择喜欢的颜色，界面会立即更新并在下次打开时保留。'),
                   const SizedBox(height: 12),
                   Wrap(
                     spacing: 8,
                     runSpacing: 8,
                     children: [
                       for (final choice in _accentColors)
-                        ChoiceChip(
-                          avatar: CircleAvatar(
-                            radius: 9,
-                            backgroundColor: choice.color,
-                          ),
-                          label: Text(choice.name),
-                          selected:
-                              _accentFor(
-                                widget.store.getString('appearance.accent'),
-                              ) ==
-                              choice.color,
-                          onSelected: (_) => widget.store.setString(
-                            'appearance.accent',
-                            choice.id,
+                        Tooltip(
+                          message: choice.name,
+                          child: ChoiceChip(
+                            avatar: CircleAvatar(
+                              radius: 12,
+                              backgroundColor: choice.color,
+                            ),
+                            label: const SizedBox(width: 10, height: 24),
+                            selected:
+                                _accentFor(
+                                  widget.store.getString('appearance.accent'),
+                                ) ==
+                                choice.color,
+                            onSelected: (_) => widget.store.setString(
+                              'appearance.accent',
+                              choice.id,
+                            ),
                           ),
                         ),
                     ],
@@ -1221,11 +1712,47 @@ class _HomePageState extends State<HomePage> {
             style: Theme.of(context).textTheme.headlineSmall
                 ?.copyWith(fontWeight: FontWeight.bold),
           ),
-          const SizedBox(height: 6),
-          const Text(
-            'MT 的 WebDAV 数据保存在 MT/records/；Kazumi 数据只读。WebDAV 密码保存在本机系统安全存储中，退出后仍会保留。建议使用 HTTPS。',
+          const SizedBox(height: 12),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Bangumi 作品资料',
+                    style: Theme.of(context).textTheme.titleMedium
+                        ?.copyWith(fontWeight: FontWeight.bold),
+                  ),
+                  SwitchListTile.adaptive(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('打开 MRecorder 时自动检查'),
+                    subtitle: const Text('只刷新已关联的作品；三天内的资料使用缓存'),
+                    value:
+                        widget.store.getString('bangumi.autoRefresh') !=
+                        'false',
+                    onChanged: (value) => widget.store.setString(
+                      'bangumi.autoRefresh',
+                      value.toString(),
+                    ),
+                  ),
+                  if (bangumiRefreshStatus.isNotEmpty)
+                    Text(bangumiRefreshStatus),
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: refreshingBangumi
+                        ? null
+                        : () => _refreshBangumiMetadata(force: true),
+                    icon: const Icon(Icons.refresh),
+                    label: Text(
+                      refreshingBangumi ? '正在刷新…' : '立即刷新 Bangumi 资料',
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ),
-          const SizedBox(height: 20),
+          const SizedBox(height: 16),
           Card(
             child: Padding(
               padding: const EdgeInsets.all(16),
@@ -1238,7 +1765,7 @@ class _HomePageState extends State<HomePage> {
                         ?.copyWith(fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(height: 6),
-                  const Text('从本机或“文件”应用选择备份；已有的较新 MT 记录会保留。'),
+                  const Text('普通导入保留较新记录；需要以文件为准时选择“用文件替换全部”。'),
                   const SizedBox(height: 12),
                   Wrap(
                     spacing: 8,
@@ -1247,7 +1774,21 @@ class _HomePageState extends State<HomePage> {
                       OutlinedButton.icon(
                         onPressed: importing ? null : _importMtFile,
                         icon: const Icon(Icons.file_open_outlined),
-                        label: const Text('导入 MT JSON'),
+                        label: const Text('导入记录文件'),
+                      ),
+                      OutlinedButton.icon(
+                        onPressed: importing
+                            ? null
+                            : () => _importMtFile(restoreDeleted: true),
+                        icon: const Icon(Icons.restore_outlined),
+                        label: const Text('从备份恢复'),
+                      ),
+                      OutlinedButton.icon(
+                        onPressed: importing || busy || _autoSyncRunning
+                            ? null
+                            : () => _importMtFile(replaceAll: true),
+                        icon: const Icon(Icons.file_copy_outlined),
+                        label: const Text('用文件替换全部'),
                       ),
                       OutlinedButton.icon(
                         onPressed: importing ? null : _importKazumiFiles,
@@ -1255,15 +1796,11 @@ class _HomePageState extends State<HomePage> {
                         label: const Text('导入 Kazumi 文件'),
                       ),
                       OutlinedButton.icon(
-                        onPressed: _exportRecords,
+                        onPressed: () => unawaited(_exportRecords()),
                         icon: const Icon(Icons.ios_share_outlined),
-                        label: const Text('导出 MT JSON'),
+                        label: const Text('导出记录'),
                       ),
                     ],
-                  ),
-                  const SizedBox(height: 8),
-                  const Text(
-                    'Kazumi 可选择一个 snapshot.json，并同时选择多个 changes/*.jsonl。旧版 histories.tmp 暂不支持。',
                   ),
                 ],
               ),
@@ -1280,8 +1817,24 @@ class _HomePageState extends State<HomePage> {
             ),
           ),
           const SizedBox(height: 16),
+          Card(
+            child: ListTile(
+              leading: Icon(
+                Icons.delete_forever_outlined,
+                color: Theme.of(context).colorScheme.error,
+              ),
+              title: Text(
+                '删除全部记录',
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+              subtitle: const Text('删除所有现存记录；需要两次确认'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: _deleteAllRecords,
+            ),
+          ),
+          const SizedBox(height: 16),
           _davPanel(
-            'MT 多端同步',
+            'MRecorder 多端同步',
             'mt',
             mtPassword,
             (v) => _updatePassword('mt', v),
@@ -1326,15 +1879,6 @@ class _HomePageState extends State<HomePage> {
             ),
           ),
           const SizedBox(height: 16),
-          const Card(
-            child: Padding(
-              padding: EdgeInsets.all(16),
-              child: Text(
-                '启用自动同步后，MT 每 10 分钟检查一次对应的 WebDAV 数据。'
-                '首次连接请先执行一次导入或同步。Kazumi 的旧版 Hive 二进制备份暂不支持直接读取。',
-              ),
-            ),
-          ),
         ],
       ),
     ),
@@ -1354,10 +1898,6 @@ class _HomePageState extends State<HomePage> {
               style: Theme.of(context).textTheme.titleMedium
                   ?.copyWith(fontWeight: FontWeight.bold),
             ),
-            const SizedBox(height: 6),
-            const Text(
-              '发现新版本后，桌面端可在应用内下载并打开安装包；iPhone/iPad 前往 GitHub 下载并自行签名安装。',
-            ),
             const SizedBox(height: 8),
             SwitchListTile.adaptive(
               contentPadding: EdgeInsets.zero,
@@ -1366,19 +1906,6 @@ class _HomePageState extends State<HomePage> {
               onChanged: (value) =>
                   widget.store.setString('updates.autoCheck', value.toString()),
             ),
-            const SizedBox(height: 6),
-            TextFormField(
-              initialValue: updateToken,
-              obscureText: true,
-              autocorrect: false,
-              enableSuggestions: false,
-              onChanged: _updateToken,
-              decoration: const InputDecoration(
-                labelText: 'GitHub 访问令牌（私有仓库需要）',
-              ),
-            ),
-            const SizedBox(height: 6),
-            const Text('只需此仓库的 Contents 读取权限；令牌保存在本机系统安全存储中。公开仓库可留空。'),
             const SizedBox(height: 12),
             Wrap(
               spacing: 8,
@@ -1447,7 +1974,7 @@ class _HomePageState extends State<HomePage> {
             const SizedBox(height: 12),
             SwitchListTile.adaptive(
               contentPadding: EdgeInsets.zero,
-              title: Text(prefix == 'mt' ? '自动同步 MT' : '自动导入 Kazumi'),
+              title: Text(prefix == 'mt' ? '自动同步 MRecorder' : '自动导入 Kazumi'),
               subtitle: const Text('关闭后仍可使用下方按钮手动操作'),
               value: widget.store.getString('$prefix.autoSync') != 'false',
               onChanged: (value) =>
@@ -1675,11 +2202,12 @@ class _EntryEditorState extends State<EntryEditor> {
   late WatchStatus status;
   late bool favorite;
   late bool episodeCountManual;
-  bool? ovaOverride;
   bool refreshingEpisodeCount = false;
   double? rating;
   DateTime? first, finish, drop;
+  late DatePrecision firstPrecision, finishPrecision, dropPrecision;
   late List<DateTime> rewatches;
+  late List<DatePrecision> rewatchPrecisions;
 
   @override
   void initState() {
@@ -1697,12 +2225,20 @@ class _EntryEditorState extends State<EntryEditor> {
     status = e?.status ?? WatchStatus.planned;
     favorite = e?.favorite ?? false;
     episodeCountManual = e?.episodeCountManual ?? false;
-    ovaOverride = e?.ovaOverride;
     rating = e?.rating;
     first = e?.firstWatchDate;
+    firstPrecision = e?.firstWatchPrecision ?? DatePrecision.day;
     finish = e?.finishDate;
+    finishPrecision = e?.finishPrecision ?? DatePrecision.day;
     drop = e?.dropDate;
+    dropPrecision = e?.dropPrecision ?? DatePrecision.day;
     rewatches = [...?e?.rewatchDates];
+    rewatchPrecisions = [
+      for (var i = 0; i < rewatches.length; i++)
+        i < (e?.rewatchDatePrecisions.length ?? 0)
+            ? e!.rewatchDatePrecisions[i]
+            : DatePrecision.day,
+    ];
     if (e?.bangumiId != null && !episodeCountManual) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) unawaited(_refreshEpisodeCount());
@@ -1737,21 +2273,24 @@ class _EntryEditorState extends State<EntryEditor> {
     super.dispose();
   }
 
-  Future<DateTime?> pick(DateTime? existing) => showDatePicker(
+  Future<({DateTime date, DatePrecision precision})?> pick(
+    DateTime? existing,
+    DatePrecision precision,
+  ) => showDialog<({DateTime date, DatePrecision precision})>(
     context: context,
-    initialDate: existing ?? DateTime.now(),
-    firstDate: DateTime(1900),
-    lastDate: DateTime(2100),
+    builder: (_) =>
+        PartialDatePicker(initialDate: existing, initialPrecision: precision),
   );
 
   Widget dateField(
     String label,
     DateTime? value,
-    ValueChanged<DateTime?> change,
+    DatePrecision precision,
+    void Function(DateTime?, DatePrecision) change,
   ) => ListTile(
     contentPadding: EdgeInsets.zero,
     title: Text(label),
-    subtitle: Text(_date(value)),
+    subtitle: Text(_date(value, precision)),
     trailing: Row(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -1759,14 +2298,14 @@ class _EntryEditorState extends State<EntryEditor> {
           IconButton(
             icon: const Icon(Icons.close),
             tooltip: '清除',
-            onPressed: () => setState(() => change(null)),
+            onPressed: () => setState(() => change(null, precision)),
           ),
         const Icon(Icons.calendar_month_outlined),
       ],
     ),
     onTap: () async {
-      final next = await pick(value);
-      if (next != null) setState(() => change(next));
+      final next = await pick(value, precision);
+      if (next != null) setState(() => change(next.date, next.precision));
     },
   );
 
@@ -1785,16 +2324,20 @@ class _EntryEditorState extends State<EntryEditor> {
         kind: kind,
         status: status,
         firstWatchDate: first,
+        firstWatchPrecision: firstPrecision,
         finishDate: finish,
+        finishPrecision: finishPrecision,
         dropDate: drop,
+        dropPrecision: dropPrecision,
         rewatchDates: rewatches,
+        rewatchDatePrecisions: rewatchPrecisions,
+        historyOrder: old?.historyOrder,
         rating: rating,
         favorite: favorite,
         notes: notes.text.trim(),
         episode: int.tryParse(episode.text),
         episodeCount: int.tryParse(episodeCount.text),
         episodeCountManual: old?.bangumiId == null || episodeCountManual,
-        ovaOverride: ovaOverride,
         progressMs: old?.progressMs,
         lastWatchAt: old?.lastWatchAt,
         kazumiSource: old?.kazumiSource ?? '',
@@ -1817,7 +2360,7 @@ class _EntryEditorState extends State<EntryEditor> {
                 context: context,
                 builder: (_) => AlertDialog(
                   title: const Text('删除这条记录？'),
-                  content: const Text('删除会同步到其他 MT 设备。'),
+                  content: const Text('删除会同步到其他 MRecorder 设备。'),
                   actions: [
                     TextButton(
                       onPressed: () => Navigator.pop(context, false),
@@ -1899,27 +2442,6 @@ class _EntryEditorState extends State<EntryEditor> {
                 ],
               ),
               const SizedBox(height: 8),
-              DropdownButtonFormField<String>(
-                initialValue: ovaOverride == null
-                    ? 'auto'
-                    : ovaOverride!
-                    ? 'yes'
-                    : 'no',
-                decoration: const InputDecoration(labelText: 'OVA 标签'),
-                items: const [
-                  DropdownMenuItem(value: 'auto', child: Text('自动识别标题')),
-                  DropdownMenuItem(value: 'yes', child: Text('标记为 OVA')),
-                  DropdownMenuItem(value: 'no', child: Text('不显示 OVA')),
-                ],
-                onChanged: (value) => setState(
-                  () => ovaOverride = switch (value) {
-                    'yes' => true,
-                    'no' => false,
-                    _ => null,
-                  },
-                ),
-              ),
-              const SizedBox(height: 8),
               SwitchListTile(
                 contentPadding: EdgeInsets.zero,
                 value: favorite,
@@ -1927,9 +2449,18 @@ class _EntryEditorState extends State<EntryEditor> {
                 onChanged: (v) => setState(() => favorite = v),
               ),
               const Divider(),
-              dateField('首看日期', first, (v) => first = v),
-              dateField('看完日期', finish, (v) => finish = v),
-              dateField('弃坑日期', drop, (v) => drop = v),
+              dateField('首看日期', first, firstPrecision, (v, p) {
+                first = v;
+                firstPrecision = p;
+              }),
+              dateField('看完日期', finish, finishPrecision, (v, p) {
+                finish = v;
+                finishPrecision = p;
+              }),
+              dateField('弃坑日期', drop, dropPrecision, (v, p) {
+                drop = v;
+                dropPrecision = p;
+              }),
               const SizedBox(height: 8),
               Row(
                 children: [
@@ -1938,8 +2469,13 @@ class _EntryEditorState extends State<EntryEditor> {
                   ),
                   TextButton.icon(
                     onPressed: () async {
-                      final date = await pick(null);
-                      if (date != null) setState(() => rewatches.add(date));
+                      final date = await pick(null, DatePrecision.day);
+                      if (date != null) {
+                        setState(() {
+                          rewatches.add(date.date);
+                          rewatchPrecisions.add(date.precision);
+                        });
+                      }
                     },
                     icon: const Icon(Icons.add),
                     label: const Text('添加'),
@@ -1948,11 +2484,14 @@ class _EntryEditorState extends State<EntryEditor> {
               ),
               for (var i = 0; i < rewatches.length; i++)
                 ListTile(
-                  title: Text(_date(rewatches[i])),
+                  title: Text(_date(rewatches[i], rewatchPrecisions[i])),
                   contentPadding: EdgeInsets.zero,
                   trailing: IconButton(
                     icon: const Icon(Icons.close),
-                    onPressed: () => setState(() => rewatches.removeAt(i)),
+                    onPressed: () => setState(() {
+                      rewatches.removeAt(i);
+                      rewatchPrecisions.removeAt(i);
+                    }),
                   ),
                 ),
               const Divider(),
@@ -2072,4 +2611,151 @@ class _EntryEditorState extends State<EntryEditor> {
       ),
     ),
   );
+}
+
+class PartialDatePicker extends StatefulWidget {
+  const PartialDatePicker({
+    super.key,
+    required this.initialDate,
+    required this.initialPrecision,
+  });
+
+  final DateTime? initialDate;
+  final DatePrecision initialPrecision;
+
+  @override
+  State<PartialDatePicker> createState() => _PartialDatePickerState();
+}
+
+class _PartialDatePickerState extends State<PartialDatePicker> {
+  late final TextEditingController year;
+  late DatePrecision precision;
+  late int month;
+  late int day;
+
+  @override
+  void initState() {
+    super.initState();
+    final initial = widget.initialDate ?? DateTime.now();
+    year = TextEditingController(text: initial.year.toString());
+    precision = widget.initialPrecision;
+    month = initial.month;
+    day = initial.day;
+  }
+
+  @override
+  void dispose() {
+    year.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final selectedYear = int.tryParse(year.text);
+    final validYear =
+        selectedYear != null && selectedYear >= 1900 && selectedYear <= 2100;
+    final days = DateTime(validYear ? selectedYear : 2000, month + 1, 0).day;
+    if (day > days) day = days;
+    return AlertDialog(
+      title: const Text('选择日期'),
+      content: SizedBox(
+        width: 320,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Wrap(
+              spacing: 8,
+              children: [
+                for (final value in DatePrecision.values)
+                  ChoiceChip(
+                    label: Text(switch (value) {
+                      DatePrecision.year => '只到年',
+                      DatePrecision.month => '到月份',
+                      DatePrecision.day => '完整日期',
+                    }),
+                    selected: precision == value,
+                    onSelected: (_) => setState(() => precision = value),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: year,
+              keyboardType: TextInputType.number,
+              inputFormatters: [
+                FilteringTextInputFormatter.digitsOnly,
+                LengthLimitingTextInputFormatter(4),
+              ],
+              decoration: InputDecoration(
+                labelText: '年份',
+                errorText: year.text.isNotEmpty && !validYear
+                    ? '请输入 1900–2100 年'
+                    : null,
+              ),
+              onChanged: (_) => setState(() {}),
+            ),
+            if (precision != DatePrecision.year) ...[
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: DropdownButtonFormField<int>(
+                      initialValue: month,
+                      decoration: const InputDecoration(labelText: '月份'),
+                      items: [
+                        for (var value = 1; value <= 12; value++)
+                          DropdownMenuItem(
+                            value: value,
+                            child: Text('$value 月'),
+                          ),
+                      ],
+                      onChanged: (value) => setState(() => month = value!),
+                    ),
+                  ),
+                  if (precision == DatePrecision.day) ...[
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: DropdownButtonFormField<int>(
+                        key: ValueKey('$selectedYear-$month-$days'),
+                        initialValue: day,
+                        decoration: const InputDecoration(labelText: '日期'),
+                        items: [
+                          for (var value = 1; value <= days; value++)
+                            DropdownMenuItem(
+                              value: value,
+                              child: Text('$value 日'),
+                            ),
+                        ],
+                        onChanged: (value) => setState(() => day = value!),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: validYear
+              ? () => Navigator.pop(context, (
+                  date: DateTime(
+                    selectedYear,
+                    precision == DatePrecision.year ? 1 : month,
+                    precision == DatePrecision.day ? day : 1,
+                  ),
+                  precision: precision,
+                ))
+              : null,
+          child: const Text('确定'),
+        ),
+      ],
+    );
+  }
 }

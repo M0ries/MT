@@ -94,7 +94,7 @@ class MtSyncService {
           final item = loaded[i];
           if (item == null) continue;
           if (resource.name != '${item.id}.json') {
-            throw const FormatException('WebDAV 文件名与 MT 记录 ID 不一致');
+            throw const FormatException('WebDAV 文件名与记录 ID 不一致');
           }
           remote[item.id] = item;
           next[resource.name] = {
@@ -131,7 +131,7 @@ class MtSyncService {
         await Future.wait(
           batch.map((item) async {
             if (!RegExp(r'^[a-zA-Z0-9_-]+$').hasMatch(item.id)) {
-              throw const FormatException('无效的 MT 记录 ID');
+              throw const FormatException('无效的记录 ID');
             }
             await client.write(
               'MT/records/${item.id}.json',

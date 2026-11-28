@@ -94,7 +94,7 @@ class WebDavClient {
     );
     request.headers.set(
       HttpHeaders.userAgentHeader,
-      'MT-MemoryTaker/1.0 (Flutter; contact via GitHub)',
+      'MRecorder/1.3.2 (Flutter; https://github.com/M0ries/MRecorder)',
     );
     for (final entry in headers.entries) {
       request.headers.set(entry.key, entry.value);

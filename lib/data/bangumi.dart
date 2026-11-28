@@ -12,14 +12,20 @@ class BangumiSubject {
     required this.coverUrl,
     required this.type,
     required this.episodeCount,
+    this.platform = '',
   });
   final int id, type, episodeCount;
-  final String title, originalTitle, summary, coverUrl;
+  final String title, originalTitle, summary, coverUrl, platform;
+  bool get isOva =>
+      type == 2 && {'OVA', 'OAD'}.contains(platform.trim().toUpperCase());
 
   factory BangumiSubject.fromJson(Map<String, dynamic> json) {
     final images = json['images'] as Map? ?? const {};
     final name = json['name'] as String? ?? '';
     final cn = json['name_cn'] as String? ?? '';
+    final platform = json['platform'] as String? ?? '';
+    final total = (json['total_episodes'] as num?)?.toInt() ?? 0;
+    final aired = (json['eps'] as num?)?.toInt() ?? 0;
     return BangumiSubject(
       id: (json['id'] as num).toInt(),
       title: cn.isEmpty ? name : cn,
@@ -28,10 +34,12 @@ class BangumiSubject {
       coverUrl: (images['large'] ?? images['common'] ?? images['medium'] ?? '')
           .toString(),
       type: (json['type'] as num?)?.toInt() ?? 2,
-      episodeCount:
-          (json['total_episodes'] as num?)?.toInt() ??
-          (json['eps'] as num?)?.toInt() ??
-          0,
+      platform: platform,
+      episodeCount: platform == '剧场版' && aired > 0
+          ? aired
+          : total > 0
+          ? total
+          : aired,
     );
   }
 }
@@ -46,7 +54,7 @@ class BangumiClient {
       );
       request.headers.set(
         HttpHeaders.userAgentHeader,
-        'MT-MemoryTaker/1.0 (https://github.com; personal watch journal)',
+        'MRecorder/1.3.2 (https://github.com/M0ries/MRecorder)',
       );
       request.headers.set(HttpHeaders.acceptHeader, 'application/json');
       if (body != null) {

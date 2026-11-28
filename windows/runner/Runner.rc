@@ -90,12 +90,12 @@ BEGIN
         BLOCK "040904e4"
         BEGIN
             VALUE "CompanyName", "app.memorytaker" "\0"
-            VALUE "FileDescription", "MT - Memory Taker" "\0"
+            VALUE "FileDescription", "MRecorder" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
-            VALUE "InternalName", "MT" "\0"
+            VALUE "InternalName", "MRecorder" "\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 app.memorytaker. All rights reserved." "\0"
-            VALUE "OriginalFilename", "MT.exe" "\0"
-            VALUE "ProductName", "MT - Memory Taker" "\0"
+            VALUE "OriginalFilename", "MRecorder.exe" "\0"
+            VALUE "ProductName", "MRecorder" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END

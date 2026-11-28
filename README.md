@@ -1,48 +1,52 @@
-# MT · Memory Taker
+# MRecorder
 
-MT 是一个简洁的 Flutter 追番与影视记录应用，支持 Windows、macOS、iPhone 和 iPad。
+把看过、正在看和想看的动漫或影视作品放在一个地方。MRecorder 可以记录观看日期、集数、评分与评价，搜索 Bangumi 作品资料，并通过 WebDAV 在自己的设备间同步。
 
-## 已实现
+## 下载
 
-- 手动添加动画、电影和剧集：想看、在看、看完、搁置、弃坑；首看、看完、弃坑和多次重看日期；评分、收藏、评价、简介、封面及观看集数。
-- 使用 Bangumi v0 API 搜索作品，带入封面、简介和总集数；无需登录即可搜索公开条目。
-- 从 Kazumi 的 WebDAV **只读**导入新版观看历史：`kazumiSync/history/snapshot.json` 和 `kazumiSync/history/changes/*.jsonl`。会导入作品信息、最近观看集数、播放位置和最近观看时间。已有的 MT 标题、状态、评分和评价会保留。
-- 将 MT 记录同步到同一个或另一台 WebDAV 的 `MT/records/`。每条作品单独保存，包含删除标记；不同设备各自新增的作品可合并，同一条记录由最新修改时间决定。连接后启动时、每十分钟及修改记录后同步。短暂断线或服务器临时错误会自动重试；设置页会显示最近一次同步或导入的结果。
-- 本地记录存入应用支持目录的 JSON 文件，保留上一版备份。
-- 在“设置 → 外观与个性化”选择主题颜色；颜色偏好在本机保存，下次打开仍生效。
-- WebDAV 密码分别存入本机系统安全存储，退出后仍保留；在密码框清空可删除对应密码。密码不会写入 MT 记录或 WebDAV 同步文件。
-- 在“设置 → 外部导入”选择本地 MT JSON 备份（也支持单条记录 JSON），或同时选择 Kazumi 新版 `snapshot.json` 与多个 `changes/*.jsonl`。导入 MT 备份时保留较新的本机记录和已有删除标记。
-- 本地文件导入在 WebDAV 同步进行时也可使用；并发保存会按顺序写入本地文件，避免记录丢失。
-- 在“设置 → 应用更新”手动检查更新，或在启动时自动检查。发现新版本会显示更新说明；Windows/macOS 可在应用内下载、校验 SHA-256 并打开安装包，也可以前往 GitHub Releases。iPhone/iPad 可前往 Releases 下载未签名包，再自行签名安装。
+到 [Releases](https://github.com/M0ries/MRecorder/releases) 下载对应安装包：
 
-## 使用
+| 设备 | 文件 | 安装方式 |
+| --- | --- | --- |
+| macOS | `MR_macos_1.3.2.dmg` | 打开后将 MRecorder 拖入“应用程序” |
+| Windows | `MR_windows_1.3.2.exe` | 运行安装程序 |
+| iPhone / iPad | `MR_ios_unsigned_1.3.2.ipa` | 未签名包，需自行签名后安装 |
 
-1. 安装 Flutter 3.47.5 或兼容的稳定版，运行 `flutter pub get`。
-2. 运行 `flutter run -d macos`、`flutter run -d windows` 或 `flutter run -d ios`。
-3. 在“设置”里填写 WebDAV 地址和凭据。Kazumi 与 MT 可以填同一地址，也可以分别填写不同地址。首次使用点“立即导入”或“立即同步”。
-4. 不使用 WebDAV 时，也可在“设置 → 外部导入”选择本地文件。iPhone/iPad 可从“文件”应用选取。
-5. 公开仓库的应用内更新检查无需令牌。如果之前为私有仓库填写过 GitHub 令牌，可在“设置 → 应用更新”清空。
+macOS 安装包未公证，首次打开可能需要在系统设置中确认。iOS/iPadOS 包不能直接安装到普通设备。
 
-建议使用 HTTPS WebDAV。HTTP 连接会以明文传输 Basic 认证凭据；若必须连接局域网 HTTP 服务，请确认网络可信。
+## 开始使用
 
-## 构建
+1. 打开“记录”，点“添加作品”。可以搜索 Bangumi 并带入封面、简介和总集数，也可以手动输入。
+2. 选择“在看”“看完”“想看”“搁置”或“弃坑”，填写观看日期、看到的集数和评价。日期可以只填年份、年月，或完整日期。
+3. 要在多台设备使用，在“设置 → MRecorder 多端同步”填写同一个 WebDAV 地址、用户名和密码，再点“立即同步”。不需要同步时，记录只保存在本机。
+4. 在“设置 → 外部导入”可以导入或导出 JSON 记录。普通导入会保留较新的现有记录；“用文件替换全部”会以所选文件为唯一清单，操作前请先导出备份。
+
+如果你正在使用 Kazumi，可以在设置中填写 Kazumi 的 WebDAV 位置或导入其新版历史文件。这个功能只读取 Kazumi 的记录；不使用 Kazumi 也能完整使用 MRecorder。
+
+## 常见问题
+
+**导入显示 0 条？** 普通导入会跳过已经存在或更新的作品。要恢复已删除的记录，选“从备份恢复”；要用文件里的清单替换现有记录，选“用文件替换全部”。
+
+**换成 MRecorder 后，旧 MT 记录还在吗？** 在。应用标识和 WebDAV 数据位置继续沿用 MT，因此原有记录、设置和同步数据可以继续使用。macOS 会把 `MRecorder.app` 作为新应用放进“应用程序”；确认记录正常后，可以手动移除旧的 `MT.app`。
+
+**需要 GitHub 账号或令牌吗？** 不需要。安装包和更新信息来自公开仓库。WebDAV 同步只需要你自己的 WebDAV 账号。
+
+## 数据与兼容性
+
+- 记录在本机保存为 JSON；开启同步后，MRecorder 会把记录存入 WebDAV 的 `MT/records/`，以兼容旧版 MT。删除和修改也会同步到其他设备。
+- WebDAV 密码保存在本机系统安全存储中，不会写入记录文件；建议使用 HTTPS。
+- Bangumi 资料用于封面、简介和总集数。你手动写的观看日期、评价与自定义总集数不会被资料刷新覆盖。
+- Kazumi 的新版 `snapshot.json` 和 `changes/*.jsonl` 历史文件可导入；旧版 `histories.tmp` 不支持。播放位置表示最近一次播放停在何处，不是累计观看时长。
+- MRecorder 目前不提供视频播放或 Bangumi 账号写入功能。
+
+## 开发
+
+项目使用 Flutter。安装兼容的 Flutter 3.47.5 后运行：
 
 ```bash
-flutter build windows --release
-flutter build macos --release
-flutter build ios --release --no-codesign
+flutter pub get
+flutter test
+flutter run -d macos
 ```
 
-GitHub Actions 会运行检查并生成可下载的 Windows 安装程序（`.exe`）、macOS 磁盘映像（`.dmg`）和未签名 iOS/iPadOS 包（`.ipa`）。Windows 安装程序包含所需的 Visual C++ 运行库。macOS 包未签名，首次打开时系统可能要求手动确认。未签名 iOS `.ipa` 不能直接安装到普通 iPhone/iPad，需要开发者签名或兼容的侧载方式。macOS/iOS 构建需要 Xcode，Windows 构建需要 Windows 开发环境。
-
-## 当前范围
-
-- Kazumi 旧版 `histories.tmp` Hive 二进制备份尚未解析；新版 JSON 同步格式可直接导入。Kazumi 同步文件不提供视频总时长或实际观看分钟数，MT 显示的是**当前播放位置**，不会把它当作累计观看时间。
-- 目前仅使用 Bangumi 公开条目资料，不会修改 Bangumi 帐号上的收藏或观看状态。
-- 统计页面尚未开发。桌面端更新会打开安装包，需要按系统提示完成安装；未签名 iOS 包无法在应用内直接替换安装。
-
-设计参考 [Kazumi](https://github.com/Predidit/Kazumi) 的简洁导航和分层思路。MT 没有复制 Kazumi 的代码或素材。Bangumi API 资料参见 [官方开发文档](https://github.com/bangumi/dev-docs)。
-
-## 发布
-
-源码与安装包发布在 [MT Releases](https://github.com/M0ries/MT/releases)。公开仓库无需 GitHub 令牌即可检查和下载更新。应用标识为 `app.memorytaker.memoryTaker`。
+Windows、macOS 与未签名 iOS/iPadOS 安装包由 [GitHub Actions](.github/workflows/build.yml) 构建。界面组织参考 [Kazumi](https://github.com/Predidit/Kazumi) 的简洁导航；作品资料使用 [Bangumi API](https://github.com/bangumi/dev-docs)。

@@ -1,9 +1,11 @@
-name: Build MT
+name: Build MRecorder
 
 on:
   push:
   pull_request:
   workflow_dispatch:
+  release:
+    types: [published]
 
 jobs:
   quality:
@@ -41,8 +43,8 @@ jobs:
       - run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\windows\MT.iss'
       - uses: actions/upload-artifact@v4
         with:
-          name: MT-Windows-Installer
-          path: build/installer/MT-Windows-Setup.exe
+          name: MR-Windows-Installer
+          path: build/installer/MR_windows_1.3.2.exe
 
   apple:
     runs-on: macos-15-intel
@@ -55,15 +57,41 @@ jobs:
           cache: true
       - run: flutter pub get
       - run: flutter build macos --release
-      - run: mkdir -p build/dmg && cp -R build/macos/Build/Products/Release/MT.app build/dmg/ && ln -s /Applications build/dmg/Applications
-      - run: hdiutil create -volname MT -srcfolder build/dmg -ov -format UDZO MT-macOS.dmg
+      - run: mkdir -p build/dmg && cp -R build/macos/Build/Products/Release/MRecorder.app build/dmg/ && ln -s /Applications build/dmg/Applications
+      - run: hdiutil create -volname MRecorder -srcfolder build/dmg -ov -format UDZO MR_macos_1.3.2.dmg
       - uses: actions/upload-artifact@v4
         with:
-          name: MT-macOS-DMG
-          path: MT-macOS.dmg
+          name: MR-macOS-DMG
+          path: MR_macos_1.3.2.dmg
       - run: flutter build ios --release --no-codesign
-      - run: mkdir -p Payload && cp -R build/ios/iphoneos/Runner.app Payload/ && zip -qr MT-iOS-unsigned.ipa Payload
+      - run: mkdir -p Payload && cp -R build/ios/iphoneos/Runner.app Payload/ && zip -qr MR_ios_unsigned_1.3.2.ipa Payload
       - uses: actions/upload-artifact@v4
         with:
-          name: MT-iOS-Unsigned-IPA
-          path: MT-iOS-unsigned.ipa
+          name: MR-iOS-Unsigned-IPA
+          path: MR_ios_unsigned_1.3.2.ipa
+
+  release:
+    if: github.event_name == 'release'
+    needs: [quality, windows, apple]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: MR-Windows-Installer
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: MR-macOS-DMG
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: MR-iOS-Unsigned-IPA
+          path: dist
+      - name: Add installers to Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" dist/MR_windows_1.3.2.exe dist/MR_macos_1.3.2.dmg dist/MR_ios_unsigned_1.3.2.ipa --clobber

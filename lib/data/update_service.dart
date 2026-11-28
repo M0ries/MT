@@ -4,13 +4,13 @@ import 'dart:io';
 import 'package:crypto/crypto.dart';
 import 'package:path_provider/path_provider.dart';
 
-const mtReleasesUrl = 'https://github.com/M0ries/MT/releases';
+const mRecorderReleasesUrl = 'https://github.com/M0ries/MRecorder/releases';
 
 class UpdateAccessException implements Exception {
   const UpdateAccessException();
 
   @override
-  String toString() => '无法读取 Release。私有仓库请填写具有 Contents 读取权限的 GitHub 令牌。';
+  String toString() => '无法读取更新信息，请稍后重试或打开 GitHub Releases。';
 }
 
 class ReleaseAsset {
@@ -47,8 +47,8 @@ class UpdateRelease {
 
   ReleaseAsset? assetForPlatform(String platform) {
     final name = switch (platform) {
-      'windows' => 'MT-Windows-Setup.exe',
-      'macos' => 'MT-macOS.dmg',
+      'windows' => 'MR_windows_$version.exe',
+      'macos' => 'MR_macos_$version.dmg',
       _ => null,
     };
     if (name == null) return null;
@@ -61,7 +61,8 @@ class UpdateRelease {
 
 class UpdateService {
   UpdateService({Uri? apiBase})
-    : apiBase = apiBase ?? Uri.https('api.github.com', '/repos/M0ries/MT');
+    : apiBase =
+          apiBase ?? Uri.https('api.github.com', '/repos/M0ries/MRecorder');
 
   final Uri apiBase;
 
@@ -92,7 +93,7 @@ class UpdateService {
       final request = await client
           .getUrl(uri)
           .timeout(const Duration(seconds: 15));
-      request.headers.set(HttpHeaders.userAgentHeader, 'MT-MemoryTaker');
+      request.headers.set(HttpHeaders.userAgentHeader, 'MRecorder');
       request.headers.set(
         HttpHeaders.acceptHeader,
         'application/vnd.github+json',
@@ -146,7 +147,7 @@ class UpdateService {
         version: tag.startsWith('v') ? tag.substring(1) : tag,
         tag: tag,
         notes: data['body'] is String ? data['body'] as String : '',
-        page: Uri.https('github.com', '/M0ries/MT/releases/tag/$tag'),
+        page: Uri.https('github.com', '/M0ries/MRecorder/releases/tag/$tag'),
         assets: assets,
       );
     } finally {
@@ -202,7 +203,7 @@ class UpdateService {
             .getUrl(uri)
             .timeout(const Duration(seconds: 20));
         request.followRedirects = false;
-        request.headers.set(HttpHeaders.userAgentHeader, 'MT-MemoryTaker');
+        request.headers.set(HttpHeaders.userAgentHeader, 'MRecorder');
         request.headers.set(
           HttpHeaders.acceptHeader,
           'application/octet-stream',
